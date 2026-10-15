@@ -1,0 +1,52 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  library:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: Test and lint the public API and engines
+        run: |
+          extra=()
+          # The worker's vendored C shims target Unix and wasm, not MSVC.
+          if [[ "$RUNNER_OS" == Windows ]]; then extra+=(--exclude day-sqlite-worker); fi
+          cargo test --locked --workspace "${extra[@]}" --features day-persistence/datetime
+          cargo clippy --locked --workspace "${extra[@]}" --all-targets --features day-persistence/datetime -- -D warnings
+          cargo check --locked -p day-persistence --no-default-features --lib
+      - name: System SQLite and encrypted SQLite
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          cargo check --locked -p day-persistence --no-default-features --features driver-rusqlite,system --lib
+          cargo test --locked -p day-persistence --no-default-features --features driver-rusqlite,cipher --test cipher
+  demo:
+    uses: daybrite/actions/.github/workflows/dayapp.yml@v1
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    with:
+      project-path: demo
+      targets: all
+      scripts: auto
+      preflight-checks: fmt, clippy, test
+      publish-release: false
+      deploy-web: false

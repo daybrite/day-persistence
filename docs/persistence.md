@@ -17,7 +17,7 @@ by *faulting* (a `get`, a batch `ensure_resident`, a list materializing the rows
 into a bounded per-model cache, and queries compile to SQL the engine answers from its
 indexes, so memory holds a working set rather than the table.
 
-The write half reuses [day-model's change log](model.md), folded. The container watches the
+The write half reuses [day-model's change log](https://daybrite.dev/docs/internal/model/), folded. The container watches the
 change log the UI already produces, and at the end of any turn that touched a store the
 accumulated changes fold into the smallest statement list that expresses them: twenty
 keystrokes into one field are one `UPDATE`, a row inserted and then filled is one `INSERT`, and
@@ -27,8 +27,8 @@ It is its own crate, beside the `day` facade rather than behind one of its featu
 depends on both, with the facade's `model` feature on:
 
 ```toml
-day = { git = "https://github.com/daybrite/day.git", features = ["model"] }
-day-persistence = { git = "https://github.com/daybrite/day.git" }   # bundled SQLite, the default engine
+day = { git = "https://github.com/daybrite/day-persistence.git", features = ["model"] }
+day-persistence = { git = "https://github.com/daybrite/day-persistence.git" }   # bundled SQLite, the default engine
 ```
 
 The crate's features select the engine: `system` links the OS's libsqlite3 instead of
@@ -44,7 +44,7 @@ The synchronous container API works on web-dom: `:memory:` databases run in-proc
 lives in the browser's origin-private file system, held by the day-sql worker and reached
 synchronously; see [The web](#the-web) below. rusqlite itself is native-only; the wasm build
 compiles the `day-sqlite-worker` engine instead, with FTS5 and R*Tree included. Compiling it
-needs a clang with a wasm32 backend; [docs/web.md](web.md) has the setup.
+needs a clang with a wasm32 backend; [docs/web.md](https://daybrite.dev/docs/internal/web/) has the setup.
 
 ## Database workers (native)
 
@@ -315,7 +315,7 @@ The container speaks to SQLite through the `SqliteDriver` trait; two drivers are
 file, `Sqlite::memory()` an in-memory database, and `Sqlite::app_data("name.db")` the per-app
 data directory: `DAY_DATA_DIR` when the host passes one (the Android and OpenHarmony hosts do),
 the platform's app-data convention otherwise, under a `day-db/` leaf beside
-[day-part-fs](fs.md)'s `day-fs/`. Builder options: `.key(Secret)` for SQLCipher,
+[day-part-fs](https://daybrite.dev/docs/internal/fs/)'s `day-fs/`. Builder options: `.key(Secret)` for SQLCipher,
 `.cipher_migrate()` to accept an older cipher generation, `.wal(false)` to opt out of WAL, and
 `.with_init(|conn| …)`, a hook over the raw rusqlite connection for loadable extensions,
 custom SQL functions, and PRAGMAs the crate does not model.
@@ -382,7 +382,7 @@ Implement it on a unit struct and select it per field with `#[model(with = …)]
 is sugar for the built-in `Json` codec. `Option` handling belongs to the framework: an impl
 never sees `NULL` and cannot disagree about it.
 
-The `datetime` feature adds the impls for [day-piece-datetime](datepicker.md)'s types:
+The `datetime` feature adds the impls for [day-piece-datetime](https://daybrite.dev/docs/internal/datepicker/)'s types:
 `DayDate` and `DayTime` canonically as `INTEGER` (epoch days, seconds-of-day), plus the
 `day_persistence::datetime` codecs `Iso8601` (`TEXT`, lexicographic order is chronological
 order), `EpochSeconds` and `EpochMillis` for interop that expects Unix time. They live in this
@@ -842,7 +842,7 @@ results themselves are under test. `log.sql()` and
 External storage (`#[model(external)]`) is a later phase, and eviction order is
 insertion-order rather than true LRU (true LRU is proposed, not promised). Row
 identity is the `#[model(id)]` key in its own stored shape (`INTEGER`, a 16-byte `BLOB` for
-`Uuid`, `TEXT` for a string key; see [model.md](model.md)); a model's own display order is a
+`Uuid`, `TEXT` for a string key; see [model.md](https://daybrite.dev/docs/internal/model/)); a model's own display order is a
 projection concern and is not persisted, though an ordered relation's position is.
 
 The key layer requires an integer key for `spatial(…)`, and a key field takes no codec: its stored
@@ -885,7 +885,7 @@ autosave, undo, queries, and `backup_to` behave as they do everywhere else.
 What the page must provide:
 
 - **Cross-origin isolation.** SharedArrayBuffer exists only under COOP/COEP response headers.
-  `day launch` sends them; a static deployment must too ([docs/web.md](web.md)). Without
+  `day launch` sends them; a static deployment must too ([docs/web.md](https://daybrite.dev/docs/internal/web/)). Without
   isolation there is no worker: memory databases still work, file opens fail with
   `Unsupported`, and `durable` reads false, which the app can show in its UI.
 - **One tab.** OPFS access handles are exclusive, so the first tab of the app owns its
@@ -898,7 +898,7 @@ turn). Database names are the "paths" the rest of the app already uses; `Sqlite:
 on the web opens the pool entry named `a.db`.
 
 The browser half belongs to the engine crate, not to the Day host page. `day-sqlite-worker`
-declares it in its manifest ([docs/web.md](web.md#web-modules)):
+declares it in its manifest ([docs/web.md](https://daybrite.dev/docs/internal/web/#web-modules)):
 
 ```toml
 [package.metadata.day.web]
@@ -926,8 +926,8 @@ channel's state words, chunking and reply framing can change without a matching 
 
 `day-persistence` is built on the framework's public API, and the dependency runs one way: an
 app names the crate in its `Cargo.toml`, and the web host learns about its browser half from
-the crate's manifest. It lives in the Day repository today and can move to a repository of its
-own with no change to the framework. Three crates make it up: `day-persistence`,
+the crate's manifest. It is maintained in the separate `daybrite/day-persistence` repository and versioned
+independently of Day. Three crates make it up: `day-persistence`,
 `day-persistence-macros` (the `Model` derive) and `day-sqlite-worker` (the web engine and its
 browser half).
 
@@ -950,3 +950,11 @@ day-macros: it restates the struct with only the fields to observe and expands t
 `observable_impls!`, so the accessors have one implementation. `Observable` accepting
 `#[model(…)]` (see [Declaring a model](#declaring-a-model)) is the one place the framework
 reads that attribute, and it reads only `id`.
+
+## SQL console metadata
+
+`SqliteConnection::query_named` supplies result column names and values on all built-in
+SQLite drivers, including browser memory and OPFS connections. Aliases are preserved; the
+worker protocol also retains column names for an empty result. The Persistence Lab console
+uses this API to display arbitrary query results as JSON. Worker protocol tests cover aliases,
+bound parameters, and empty results; the demo dayscript checks both memory and durable queries.

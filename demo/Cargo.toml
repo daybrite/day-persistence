@@ -1,0 +1,40 @@
+[package]
+name = "persistence-lab"
+version.workspace = true
+edition = "2024"
+
+[features]
+# `mock` keeps bare cargo and rust-analyzer compiling; `day build` overrides it with
+# `--no-default-features --features <backend>` (https://daybrite.dev/docs/project-structure).
+default = ["mock"]
+appkit = ["day/appkit"]
+gtk = ["day/gtk"]
+qt = ["day/qt"]
+uikit = ["day/uikit"]
+mdc = ["day/mdc"]
+xaml = ["day/xaml"]
+winui = ["day/winui"]
+arkui = ["day/arkui"]
+dom = ["day/dom"]
+mock = ["day/mock"]
+
+# Cargo defaults to rlib; the mobile pipeline requests staticlib/cdylib via `cargo rustc`.
+[lib]
+# A constant lib name: staged artifacts and the `dayapp::` import never move on a package rename.
+name = "dayapp"
+
+[dependencies]
+day = { git = "https://github.com/daybrite/day.git", features = ["model"] }
+day-persistence = { path = "../crates/day-persistence" }
+# JSON is the portable typed-record exchange format.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+day-build = { git = "https://github.com/daybrite/day.git" }
+
+
+[workspace]
+
+[workspace.package]
+version = "0.1.0"

@@ -1,0 +1,104 @@
+# Identical operations on every toolkit. All SQL/JSON/title values are synthetic fixtures.
+flow:
+  - wait_for: { id: nav }
+  - navigate: { route: database }
+  - tap: { id: open-memory }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: records }
+  - input: { id: note-id, text: "7" }
+  - input: { id: note-title, text: "Synthetic fixture" }
+  - toggle: { id: note-done, value: true }
+  - tap: { id: save-note }
+  - assert_text: { id: status, key: operation_ok }
+  - assert_text: { id: record-count, text: "1" }
+  - screenshot: typed-records
+  - a11y_audit: {}
+
+  - navigate: { route: sql }
+  - input: { id: sql-input, text: "UPDATE notes SET title='SQL fixture' WHERE id=7" }
+  - tap: { id: run-statements }
+  - assert_text: { id: status, key: operation_ok }
+  - input: { id: sql-input, text: "SELECT title FROM notes WHERE id=7" }
+  - tap: { id: run-query }
+  - assert_text: { id: status, key: operation_ok }
+  - assert_text:
+      id: sql-results
+      text: |-
+        [
+          {
+            "title": "SQL fixture"
+          }
+        ]
+  - screenshot: sql-console
+
+  - navigate: { route: exchange }
+  - tap: { id: export-json }
+  - assert_text:
+      id: exchange-json
+      text: |-
+        [
+          {
+            "id": 7,
+            "title": "SQL fixture",
+            "done": true
+          }
+        ]
+  - navigate: { route: records }
+  - tap: { id: delete-note }
+  - assert_text: { id: record-count, text: "0" }
+  - navigate: { route: exchange }
+  - tap: { id: import-json }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: records }
+  - assert_text: { id: record-count, text: "1" }
+  - navigate: { route: exchange }
+  - input: { id: exchange-json, text: '[{"id":1,"title":"a","done":false},{"id":1,"title":"b","done":true}]' }
+  - tap: { id: import-json }
+  - assert_text: { id: status, key: invalid_import_ids }
+  - navigate: { route: records }
+  - assert_text: { id: record-count, text: "1" }
+
+  - navigate: { route: database }
+  - tap: { id: integrity }
+  - assert_text: { id: status, key: operation_ok }
+  - tap: { id: vacuum }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: log }
+  - tap: { id: refresh-log }
+  - assert_text: { id: status, key: operation_ok }
+  - screenshot: sql-log
+
+  # Reopen a dedicated named database, never a developer's exploratory database.
+  - navigate: { route: database }
+  - input: { id: database-name, text: "lab-script.sqlite" }
+  - tap: { id: open-durable }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: sql }
+  - input: { id: sql-input, text: "DELETE FROM notes" }
+  - tap: { id: run-statements }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: records }
+  - tap: { id: save-note }
+  - assert_text: { id: record-count, text: "1" }
+  - navigate: { route: database }
+  - tap: { id: checkpoint }
+  - assert_text: { id: status, key: operation_ok }
+  - tap: { id: open-memory }
+  - tap: { id: open-durable }
+  - assert_text: { id: status, key: operation_ok }
+  - navigate: { route: sql }
+  - input: { id: sql-input, text: "SELECT count(*) AS total FROM notes" }
+  - tap: { id: run-query }
+  - assert_text: { id: status, key: operation_ok }
+  - assert_text:
+      id: sql-results
+      text: |-
+        [
+          {
+            "total": 1
+          }
+        ]
+  - navigate: { route: records }
+  - assert_text: { id: record-count, text: "1" }
+  - tap: { id: delete-note }
+  - assert_text: { id: record-count, text: "0" }

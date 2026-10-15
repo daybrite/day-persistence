@@ -504,6 +504,37 @@ impl SqliteConnection for RusqliteConn {
             },
         }
     }
+    fn query_named(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        row: &mut dyn FnMut(&[String], &dyn Row),
+    ) -> Result<(), DbError> {
+        use day_sqlite_worker::protocol::{Reply as WReply, Req as WReq};
+        match &self.conn {
+            WebConn::Memory(c) => c
+                .query_named(sql, &web::to_wire(params), &mut |names, r| {
+                    let vals: Vec<Value> = r.into_iter().map(web::from_wire).collect();
+                    row(names, &vals);
+                })
+                .map(|_| ())
+                .map_err(|e| DbError::driver(format!("{e} in `{sql}`"))),
+            WebConn::Remote(id) => match web::channel::call(&WReq::QueryNamed {
+                conn: *id,
+                sql: sql.to_owned(),
+                params: web::to_wire(params),
+            })? {
+                WReply::NamedRows { names, rows } => {
+                    for r in rows {
+                        let vals: Vec<Value> = r.into_iter().map(web::from_wire).collect();
+                        row(&names, &vals);
+                    }
+                    Ok(())
+                }
+                other => Err(web::unexpected(other)),
+            },
+        }
+    }
 }
 
 /// A dropped remote connection closes its worker side, best effort, like a file handle.

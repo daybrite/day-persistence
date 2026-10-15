@@ -478,22 +478,65 @@ impl Connection {
         params: &[Value],
         f: &mut dyn FnMut(Vec<Value>),
     ) -> Result<(), SqlError> {
+        self.query_impl(sql, params, false, &mut |_, row| f(row))
+            .map(|_| ())
+    }
+
+    /// Query with result column names, including aliases. Names are returned even for no rows.
+    pub fn query_named(
+        &self,
+        sql: &str,
+        params: &[Value],
+        f: &mut dyn FnMut(&[String], Vec<Value>),
+    ) -> Result<Vec<String>, SqlError> {
+        self.query_impl(sql, params, true, f)
+    }
+
+    fn query_impl(
+        &self,
+        sql: &str,
+        params: &[Value],
+        named: bool,
+        f: &mut dyn FnMut(&[String], Vec<Value>),
+    ) -> Result<Vec<String>, SqlError> {
         let (stmt, _) = self.prepare(sql.as_bytes())?;
         let stmt = stmt.ok_or_else(|| err(1, "empty statement"))?;
         self.bind(&stmt, params)?;
+        // Step before reading metadata: SQLite may automatically reprepare on schema changes.
+        let mut rc = unsafe { b::sqlite3_step(stmt.0) };
+        let n = unsafe { b::sqlite3_column_count(stmt.0) };
+        let names = if named {
+            (0..n)
+                .map(|i| {
+                    let ptr = unsafe { b::sqlite3_column_name(stmt.0, i) };
+                    if ptr.is_null() {
+                        Err(err(
+                            b::SQLITE_NOMEM,
+                            "SQLite could not allocate a column name",
+                        ))
+                    } else {
+                        Ok(unsafe { core::ffi::CStr::from_ptr(ptr) }
+                            .to_string_lossy()
+                            .into_owned())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         loop {
-            match unsafe { b::sqlite3_step(stmt.0) } {
+            match rc {
                 b::SQLITE_ROW => {
-                    let n = unsafe { b::sqlite3_column_count(stmt.0) };
                     let mut row = Vec::with_capacity(n as usize);
                     for i in 0..n {
                         row.push(unsafe { column_value(stmt.0, i) });
                     }
-                    f(row);
+                    f(&names, row);
                 }
-                b::SQLITE_DONE => return Ok(()),
+                b::SQLITE_DONE => return Ok(names),
                 rc => return Err(err(rc, unsafe { errmsg(self.db) })),
             }
+            rc = unsafe { b::sqlite3_step(stmt.0) };
         }
     }
 
@@ -660,6 +703,11 @@ fn dispatch(req: Req) -> Reply {
             let mut rows = Vec::new();
             c.query(&sql, &params, &mut |row| rows.push(row))
                 .map(|_| Reply::Rows(rows))
+        }),
+        Req::QueryNamed { conn, sql, params } => with_conn(conn, |c| {
+            let mut rows = Vec::new();
+            c.query_named(&sql, &params, &mut |_, row| rows.push(row))
+                .map(|names| Reply::NamedRows { names, rows })
         }),
         Req::Exists { name } => Reply::Bool(vfs::fsx::exists(&name)),
         Req::List => Reply::Names(vfs::fsx::list()),
@@ -992,6 +1040,28 @@ mod tests {
                 params: vec![],
             }),
             Reply::Rows(vec![vec![Value::Int(1), Value::Text("rain later".into())]])
+        );
+        assert_eq!(
+            ask(Req::QueryNamed {
+                conn,
+                sql: "SELECT id AS key, body AS title FROM notes WHERE id=?".into(),
+                params: vec![Value::Int(1)]
+            }),
+            Reply::NamedRows {
+                names: vec!["key".into(), "title".into()],
+                rows: vec![vec![Value::Int(1), Value::Text("rain later".into())]]
+            }
+        );
+        assert_eq!(
+            ask(Req::QueryNamed {
+                conn,
+                sql: "SELECT body AS title FROM notes WHERE id=?".into(),
+                params: vec![Value::Int(99)]
+            }),
+            Reply::NamedRows {
+                names: vec!["title".into()],
+                rows: vec![]
+            }
         );
         // Errors carry SQLite's message, and the connection survives them.
         let Reply::Err(msg) = ask(Req::Query {

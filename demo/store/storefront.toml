@@ -1,0 +1,12 @@
+[storefront.metadata]
+name = "Persistence Lab"
+subtitle = "Explore typed SQLite storage"
+short = "A native workbench for typed records, SQL, and JSON exchange."
+description = """
+Explore Day persistence with a disposable in-memory database or a named database in app storage.
+Edit typed notes, run SQL, inspect statement logs, import and export JSON, and check database integrity.
+This developer demo operates entirely on local data. SQL commands can alter or delete that data.
+"""
+keywords = ["sqlite", "database", "sql", "development"]
+release-notes = "Initial standalone persistence demo."
+privacy-url = "https://github.com/daybrite/day-persistence/blob/main/demo/PRIVACY.md"

@@ -1,0 +1,6 @@
+target/
+build/
+.cache/
+.DS_Store
+.cargo/config.toml
+!AGENTS.md

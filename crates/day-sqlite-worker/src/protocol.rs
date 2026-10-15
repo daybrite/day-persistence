@@ -52,6 +52,12 @@ pub enum Req {
         sql: String,
         params: Vec<Value>,
     },
+    /// Run one statement with its column names; answers `Reply::NamedRows`.
+    QueryNamed {
+        conn: u32,
+        sql: String,
+        params: Vec<Value>,
+    },
     /// Storage-pool verbs, by database name (the file-per-document surface).
     Exists {
         name: String,
@@ -75,6 +81,10 @@ pub enum Req {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reply {
     Ok,
+    NamedRows {
+        names: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
     Conn(u32),
     Changes(u64),
     Rows(Vec<Vec<Value>>),
@@ -154,6 +164,12 @@ pub fn encode_req(req: &Req) -> Vec<u8> {
             put_str(&mut buf, sql);
             put_values(&mut buf, params);
         }
+        Req::QueryNamed { conn, sql, params } => {
+            buf.push(11);
+            buf.extend_from_slice(&conn.to_le_bytes());
+            put_str(&mut buf, sql);
+            put_values(&mut buf, params);
+        }
         Req::Exists { name } => {
             buf.push(6);
             put_str(&mut buf, name);
@@ -190,6 +206,17 @@ pub fn encode_reply(reply: &Reply) -> Vec<u8> {
         }
         Reply::Rows(rows) => {
             buf.push(3);
+            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            for row in rows {
+                put_values(&mut buf, row);
+            }
+        }
+        Reply::NamedRows { names, rows } => {
+            buf.push(7);
+            buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+            for name in names {
+                put_str(&mut buf, name);
+            }
             buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
             for row in rows {
                 put_values(&mut buf, row);
@@ -315,6 +342,11 @@ pub fn decode_req(buf: &[u8]) -> Result<Req, WireError> {
             sql: r.str()?,
             params: r.values()?,
         },
+        11 => Req::QueryNamed {
+            conn: r.u32()?,
+            sql: r.str()?,
+            params: r.values()?,
+        },
         6 => Req::Exists { name: r.str()? },
         7 => Req::List,
         8 => Req::Delete { name: r.str()? },
@@ -353,6 +385,19 @@ pub fn decode_reply(buf: &[u8]) -> Result<Reply, WireError> {
             Reply::Names(names)
         }
         6 => Reply::Bytes(r.bytes()?),
+        7 => {
+            let n = r.u32()? as usize;
+            let mut names = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                names.push(r.str()?);
+            }
+            let n = r.u32()? as usize;
+            let mut rows = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                rows.push(r.values()?);
+            }
+            Reply::NamedRows { names, rows }
+        }
         255 => Reply::Err(r.str()?),
         _ => return Err(WireError),
     };
@@ -404,6 +449,11 @@ mod tests {
             params: vec![],
         });
         round_trip_req(Req::Exists { name: "a".into() });
+        round_trip_req(Req::QueryNamed {
+            conn: 3,
+            sql: "SELECT ? AS value".into(),
+            params: vec![Value::Int(7)],
+        });
         round_trip_req(Req::List);
         round_trip_req(Req::Delete { name: "a".into() });
         round_trip_req(Req::Export { name: "a".into() });
@@ -423,10 +473,29 @@ mod tests {
             vec![Value::Null, Value::Real(f64::MIN)],
             vec![],
         ]));
+        round_trip_reply(Reply::NamedRows {
+            names: vec!["id".into(), "title".into()],
+            rows: vec![vec![Value::Int(7), Value::Text("fixture".into())]],
+        });
+        round_trip_reply(Reply::NamedRows {
+            names: vec!["empty".into()],
+            rows: vec![],
+        });
         round_trip_reply(Reply::Bool(true));
         round_trip_reply(Reply::Names(vec!["a.db".into(), "b.db".into()]));
         round_trip_reply(Reply::Bytes(vec![0; 100_000]));
         round_trip_reply(Reply::Err("no such table: t".into()));
+    }
+
+    #[test]
+    fn truncated_named_rows_are_rejected() {
+        let bytes = encode_reply(&Reply::NamedRows {
+            names: vec!["fixture".into()],
+            rows: vec![vec![Value::Text("value".into())]],
+        });
+        for cut in 0..bytes.len() {
+            assert_eq!(decode_reply(&bytes[..cut]), Err(WireError));
+        }
     }
 
     #[test]

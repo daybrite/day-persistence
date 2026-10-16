@@ -100,6 +100,12 @@ fn main() {
 
     let mut cc = cc::Build::new();
     cc.warnings(false)
+        // Optimized in every profile. At a debug build's -O0, SQLite's recursive parser and
+        // code generator take frames large enough that preparing an app's schema (FTS5
+        // triggers, foreign keys) overflowed WebKit's worker stack: the worker trapped with
+        // "Maximum call stack size exceeded" and Safari apps came up with no database.
+        // Chromium's larger stack hid it, and release builds never had it.
+        .opt_level(2)
         .flag_if_supported("-Wno-macro-redefined")
         // First on the include path: the crate's own hermetic <stdint.h>/<limits.h>
         // (include/*.h). The compiler's copies are self-contained only when freestanding;

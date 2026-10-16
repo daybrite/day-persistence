@@ -12,8 +12,12 @@ initially, so experimenting does not touch saved notes.
 - **Import / Export:** copy typed notes as JSON, edit or paste a document, and replace the note
   table. Duplicate/zero IDs and malformed JSON are rejected before mutation. Export before
   replacing data you want to keep. File exchange uses copy/paste; there is no file picker.
-- **SQL log:** inspect the latest 200 engine statements. Native and in-memory browser SQL
-  appears here; durable browser SQL appears in the browser's developer console.
+
+Every page shows the **SQL log** under its controls, in a split you can resize. Each statement
+the engine runs is added as it runs, so typed edits, queries, and maintenance all show the SQL
+they produce. The log keeps the latest 200 statements across reopened databases. Durable
+browser databases log to the browser's developer console instead. The toolbar's SQL log button
+shows and hides it.
 
 The console can alter schema and data, including the app's `notes` table. Destructive SQL is
 intentional in a database workbench; use a disposable database for such experiments. Returning
@@ -29,9 +33,10 @@ day launch -t macos-appkit --script dayscript/demo.yaml
 ```
 
 The dayscript has no platform skips. It checks typed edits, direct SQL, validated JSON import,
-export/delete/import restoration, maintenance, and reopening a named fixture database. It
-uses only `lab-script.sqlite` for durable tests and removes its notes on completion. CI runs
-it on the declared targets; local HarmonyOS emulator testing is intentionally excluded.
+export/delete/import restoration, maintenance, the live SQL log and its toggle, and reopening
+a named fixture database. It uses only `lab-script.sqlite` for durable tests and removes its
+notes on completion. CI runs it on the declared targets; local HarmonyOS emulator testing is
+intentionally excluded.
 
 See the [persistence guide](../docs/persistence.md), [Day API tour](https://daybrite.dev/docs/api-tour)
 and [dayscript reference](https://daybrite.dev/docs/dayscript).

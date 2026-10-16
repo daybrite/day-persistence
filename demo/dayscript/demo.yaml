@@ -58,15 +58,21 @@ flow:
   - navigate: { route: records }
   - assert_text: { id: record-count, text: "1" }
 
+  # The SQL log sits under every page and gains each statement as it runs.
   - navigate: { route: database }
+  - tap: { id: clear-log }
+  - assert_visible: { id: sql-log-empty }
   - tap: { id: integrity }
   - assert_text: { id: status, key: operation_ok }
+  - assert_visible: { id: sql-log }
   - tap: { id: vacuum }
   - assert_text: { id: status, key: operation_ok }
-  - navigate: { route: log }
-  - tap: { id: refresh-log }
-  - assert_text: { id: status, key: operation_ok }
   - screenshot: sql-log
+  - toolbar: { item: toggle-console, on: false }
+  - assert_text: { id: status, key: operation_ok }
+  - screenshot: console-hidden
+  - toolbar: { item: toggle-console, on: true }
+  - assert_visible: { id: sql-log }
 
   # Reopen a dedicated named database, never a developer's exploratory database.
   - navigate: { route: database }

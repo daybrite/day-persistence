@@ -3,7 +3,7 @@
 use day::prelude::*;
 use day_persistence::{DbError, Model, ModelContainer, Sort, Sqlite, Value, schema};
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::collections::VecDeque;
 
 /// A typed row. Its generated field accessors participate in autosave and change tracking.
 #[derive(Model, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -15,29 +15,34 @@ pub(crate) struct Note {
     pub done: bool,
 }
 
-/// The small lab database and a bounded SQL trace; each window owns its own connection.
+/// The latest engine statements, oldest first. A window keeps one across reopened connections,
+/// so its console reads as one session, and a signal, so the console redraws per statement.
+pub(crate) type Trace = Signal<VecDeque<String>>;
+
+/// How many statements a trace retains.
+pub(crate) const TRACE_LIMIT: usize = 200;
+
+/// The small lab database; each window owns its own connection.
 pub(crate) struct Database {
     pub container: ModelContainer,
-    pub trace: Rc<RefCell<VecDeque<String>>>,
 }
 
 impl Database {
     /// The same driver API runs in native SQLite and the browser worker.
-    pub fn open(driver: Sqlite) -> Result<Self, DbError> {
-        let trace = Rc::new(RefCell::new(VecDeque::new()));
-        let sink = trace.clone();
+    pub fn open(driver: Sqlite, trace: Trace) -> Result<Self, DbError> {
         let container = ModelContainer::open(
             driver.trace_sql(move |sql| {
                 day::log::debug!("SQL: {sql}");
-                let mut lines = sink.borrow_mut();
-                if lines.len() == 200 {
-                    lines.pop_front();
-                }
-                lines.push_back(sql.to_owned());
+                trace.update(|lines| {
+                    if lines.len() == TRACE_LIMIT {
+                        lines.pop_front();
+                    }
+                    lines.push_back(sql.to_owned());
+                });
             }),
             schema![Note],
         )?;
-        Ok(Self { container, trace })
+        Ok(Self { container })
     }
 
     /// Enumerate the query, never the cache: the cache contains only resident rows.
@@ -138,9 +143,14 @@ pub(crate) enum ImportError {
 mod tests {
     use super::*;
 
+    fn open(driver: Sqlite) -> Database {
+        Database::open(driver, Signal::new(VecDeque::new())).unwrap()
+    }
+
     #[test]
     fn typed_edits_raw_sql_and_exchange_share_one_database() {
-        let db = Database::open(Sqlite::memory()).unwrap();
+        let trace = Signal::new(VecDeque::new());
+        let db = Database::open(Sqlite::memory(), trace).unwrap();
         db.save_note(Note {
             id: 7,
             title: "Synthetic fixture".into(),
@@ -161,13 +171,37 @@ mod tests {
                 .unwrap()
                 .contains("\"total\": 1")
         );
-        assert!(db.trace.borrow().iter().any(|s| s.contains("UPDATE")));
+        assert!(trace.with_untracked(|lines| lines.iter().any(|s| s.contains("UPDATE"))));
         assert!(db.container.integrity_check().unwrap().is_empty());
     }
 
     #[test]
+    fn trace_spans_reopened_connections_and_keeps_the_latest_statements() {
+        let trace = Signal::new(VecDeque::new());
+        let first = Database::open(Sqlite::memory(), trace).unwrap();
+        first
+            .execute("CREATE TABLE trace_fixture (n INTEGER)")
+            .unwrap();
+        drop(first);
+        let second = Database::open(Sqlite::memory(), trace).unwrap();
+        assert!(trace.with_untracked(|lines| lines.iter().any(|s| s.contains("trace_fixture"))));
+        for n in 0..TRACE_LIMIT {
+            second.query(&format!("SELECT {n} AS fixture")).unwrap();
+        }
+        trace.with_untracked(|lines| {
+            assert_eq!(lines.len(), TRACE_LIMIT);
+            assert!(!lines.iter().any(|s| s.contains("trace_fixture")));
+            assert!(
+                lines
+                    .iter()
+                    .any(|s| s.contains(&format!("SELECT {} AS fixture", TRACE_LIMIT - 1)))
+            );
+        });
+    }
+
+    #[test]
     fn invalid_import_leaves_existing_records_untouched() {
-        let db = Database::open(Sqlite::memory()).unwrap();
+        let db = open(Sqlite::memory());
         db.save_note(Note {
             id: 1,
             title: "Retained fixture".into(),
@@ -189,7 +223,7 @@ mod tests {
             std::process::id()
         ));
         {
-            let db = Database::open(Sqlite::at(&path)).unwrap();
+            let db = open(Sqlite::at(&path));
             db.save_note(Note {
                 id: 1,
                 title: "Durable fixture".into(),
@@ -198,7 +232,7 @@ mod tests {
             .unwrap();
         }
         {
-            let db = Database::open(Sqlite::at(&path)).unwrap();
+            let db = open(Sqlite::at(&path));
             assert_eq!(db.notes().unwrap()[0].title, "Durable fixture");
         }
         std::fs::remove_file(path).unwrap();

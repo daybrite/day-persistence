@@ -3,7 +3,8 @@
 Read ../AGENTS.md. This app exercises the public API of the crate in the same checkout.
 
 - src/model.rs: typed records, database commands, SQL trace and headless regression tests.
-- src/lib.rs: one window's state and the five native navigation destinations.
+- src/lib.rs: one window's state, the four native navigation destinations, and the SQL log
+  console split under each page.
 - resource/locales/en/app.ftl: generated symbolic accessors for all app-owned UI text.
 - dayscript/demo.yaml: the same typed/SQL/import/reopen round trip on every platform.
 

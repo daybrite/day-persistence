@@ -160,3 +160,79 @@ fn a_query_backed_list_splices_instead_of_reloading() {
         "the row repaints itself; the set is untouched"
     );
 }
+
+#[derive(Model, Clone, Default, PartialEq, Debug)]
+#[model(table = "ranked")]
+pub struct Ranked {
+    #[model(id)]
+    pub id: u32,
+    pub rank: u32,
+}
+
+/// A drag over a rank-sorted query: the app writes the new ranks, and the requery is the echo
+/// of the move the native rows already made, so the host sees neither a splice nor a reload.
+/// An app that answers with some other order gets a reload, never a replay of the query's own
+/// deltas onto the moved rows.
+#[cfg(feature = "pieces")]
+#[test]
+fn a_query_backed_list_takes_a_native_move_as_its_echo() {
+    use day_persistence::Sort;
+
+    let container =
+        ModelContainer::open(Sqlite::memory(), schema![Ranked]).expect("open memory container");
+    let store: Store<Keyed<Ranked>> = container.cache::<Ranked>();
+    store.update("seed", |k| {
+        *k = Keyed::new((0..4u32).map(|n| Ranked { id: n + 1, rank: n }).collect());
+    });
+    let query = container.query::<Ranked>().sort(Sort::asc("rank")).live();
+    let ids = {
+        let query = query.clone();
+        move || -> Vec<u32> { query.try_collect().unwrap().iter().map(|r| r.id).collect() }
+    };
+    // Rotate the ranks as the move describes; `refuse` writes the original order back instead.
+    let refuse = std::rc::Rc::new(std::cell::Cell::new(false));
+    let write_ranks = {
+        let (ids, refuse) = (ids.clone(), refuse.clone());
+        move |from: usize, to: usize| {
+            let mut order = ids();
+            if !refuse.get() {
+                let id = order.remove(from);
+                order.insert(to, id);
+            } else {
+                order.swap(0, 1);
+            }
+            for (rank, id) in order.iter().enumerate() {
+                store.elem(*id).rank().write(rank as u32);
+            }
+        }
+    };
+    let probe = boot(move || {
+        list(query, |slot: ModelSlot<Ranked>| {
+            label(move || slot.id().read().to_string())
+        })
+        .row_height(RowHeight::Uniform(40.0))
+        .reorderable(true)
+        .on_reorder(write_ranks)
+        .any()
+    });
+    flush_sync();
+    let host = probe.find_by_kind("day.list")[0].0;
+    let patches = || count(&probe, "list splice") + count(&probe, "list reload");
+
+    let before = patches();
+    assert!(probe.list_move(host, 2, 0));
+    flush_sync();
+    assert_eq!(ids(), [3, 1, 2, 4]);
+    assert_eq!(patches(), before, "the requery is the move's own echo");
+
+    refuse.set(true);
+    let reloads = count(&probe, "list reload");
+    assert!(probe.list_move(host, 3, 1));
+    flush_sync();
+    assert_eq!(ids(), [1, 3, 2, 4]);
+    assert_eq!(
+        count(&probe, "list reload"),
+        reloads + 1,
+        "another order reloads"
+    );
+}

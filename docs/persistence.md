@@ -526,6 +526,11 @@ changes reach the native list as `ListPatch::Splice` row deltas it can animate; 
 NSTableView slides the row out instead of reloading. Hosts that cannot animate treat a
 splice as a reload.
 
+A query list can be `.reorderable(true)` when its sort is a column the app owns, such as a
+rank. A drag moves the native row first; the query's row source serves the moved order until
+the app's `on_reorder` writes the new ranks, and the requery that follows is the echo of that
+move, so the list neither splices nor reloads (`tests/ui_autosave.rs`).
+
 There are three tiers of SQL access, each with its own price: the typed builder (incremental,
 the default); `query_raw::<M>(sql, params, &["tables"])`, a read-only SELECT of ids, re-run
 whole whenever a flush touches a named table; and `with_connection(|conn| …)`, the driver's

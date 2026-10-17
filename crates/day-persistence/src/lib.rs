@@ -4272,9 +4272,16 @@ mod pieces_glue {
                 QueryEvents::Reload | QueryEvents::None => None,
             }
         }
-        fn commit_move(&self, _from: usize, _to: usize) {
-            // A sorted result set does not take user reordering; the app decides what a drag
-            // means and writes the model, which flows back through the query.
+        fn commit_move(&self, from: usize, to: usize) {
+            // The native drag already moved the row: serve that order until the app's write
+            // (its on_reorder, typically a rank column the query sorts by) requeries. The list
+            // expects exactly this order back as the echo of its own move; left unrotated, the
+            // echo never matched, and the query's own move was replayed on rows already moved.
+            let mut keys = self.keys.borrow_mut();
+            if from < keys.len() && to < keys.len() {
+                let key = keys.remove(from);
+                keys.insert(to, key);
+            }
         }
         fn commit_delete(&self, index: usize) {
             // The native delete affordance: drop from the local snapshot; the app's on_delete

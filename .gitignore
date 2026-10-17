@@ -3,4 +3,7 @@ build/
 .cache/
 .DS_Store
 .cargo/config.toml
+# CI resolves current day/main; consuming applications own their lockfiles.
+/Cargo.lock
+/demo/Cargo.lock
 !AGENTS.md

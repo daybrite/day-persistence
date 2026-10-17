@@ -4,10 +4,10 @@ This workspace owns persistence, its derive macro, and the SQLite browser worker
 framework dependency one-way. Changes to storage semantics need regression tests and updates
 to docs/persistence.md. Keep the three crate versions synchronized.
 
-Local Cargo patches rewrite both lockfiles. Never stage those local-path resolutions: run
-`python3 scripts/check-lockfiles.py --staged` before committing, and validate dependency
-changes with `--locked` in a clean checkout without local patches. Enable `.githooks` as
-described in README.md. Keep both lockfiles Git-backed for external dependencies.
+Do not commit Cargo.lock or demo/Cargo.lock. CI tests the latest day/main, resolved once per
+run and shared by the library matrix and demo. Keep update-day-deps enabled for the demo.
+Local Cargo patches and their lockfiles stay local; validate CI dependencies in a clean
+checkout without those patches. Use --locked after generating the run's dependency set.
 
 Run cargo fmt --all, cargo test --workspace --features day-persistence/datetime, and cargo
 clippy --workspace --all-targets --features day-persistence/datetime -- -D warnings. The demo

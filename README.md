@@ -42,6 +42,12 @@ Windows), checks the trait-only and system SQLite configurations, tests SQLCiphe
 and runs the same demo dayscript through Day's shared platform workflow. HarmonyOS acceptance
 runs in CI; do not start its emulator on the ARM development host.
 
+CI resolves the latest `day/main` once per run. All library jobs use one generated lockfile,
+and the demo resolves its dependencies and installs its CLI at that same Day revision.
+The generated locks stay fixed during the run; daily CI also checks new Day changes when
+nobody pushes here. Neither `Cargo.lock` nor `demo/Cargo.lock` is committed. Consuming
+applications own their lockfiles.
+
 To work against a sibling Day checkout, add ignored Cargo patches in `.cargo/config.toml`
 for each Day Git dependency (including `day` and `day-build` from the demo). Cargo searches
 this parent configuration for `demo/`, too. For example:
@@ -59,25 +65,9 @@ paths for your layout (a sibling `day/` uses `../day/crates/...`).
 Do not commit machine-specific paths. The checked-in demo deliberately depends on this
 repository's crate by relative path, so its CI tests the exact checkout.
 
-Local patches also rewrite `Cargo.lock` and `demo/Cargo.lock`: external Day packages lose
-their Git sources and unused local patches can appear in the locks. These lockfiles work
-with the local configuration but fail CI's `--locked` checks. Before staging them, regenerate
-them in a clean checkout without local Cargo patches (including parent/global configuration),
-and run the locked test and lint commands there. If only local experimentation changed a
-lockfile, restore its last Git-backed version instead of updating dependencies unnecessarily.
-
-Enable the staged-lockfile guard once per clone (requires Python 3.11 or newer):
-
-```sh
-git config --local core.hooksPath .githooks
-```
-
-If you already use a hooks directory, call `python3 scripts/check-lockfiles.py --staged`
-from its pre-commit hook instead of replacing it. The guard reads both lockfiles from Git's
-index, permits this repository's own path dependencies, and rejects external local-path
-dependencies and unused local patches. It never rewrites or stages files. Run
-`python3 scripts/check-lockfiles.py` to check the working files; CI runs this check too, since
-hooks are opt-in and can be bypassed. This guard complements Cargo's full `--locked` validation.
+Local patches can rewrite the ignored lockfiles without affecting CI. To reproduce CI locally,
+use a clean checkout without local Cargo patches, resolve the desired `day/main` revision,
+and then run the checks with `--locked`. No lockfile pre-commit hook is needed.
 
 ## Initial publication
 

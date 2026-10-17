@@ -3,10 +3,41 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Day can change even when this repository has no new commits.
+    - cron: "15 7 * * *"
 permissions:
   contents: read
 jobs:
+  dependencies:
+    name: Resolve current Day main
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.day.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve one Day revision and library lock for this run
+        id: day
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(git ls-remote https://github.com/daybrite/day.git refs/heads/main | awk '{print $1}')
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Could not resolve day/main"; exit 1; }
+          cargo generate-lockfile
+          # The library uses day-pieces, not the umbrella day crate; all share one Git source.
+          cargo update -p day-pieces --precise "$revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "Library and demo test day/main at $revision" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: library-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
   library:
+    needs: dependencies
     strategy:
       fail-fast: false
       matrix:
@@ -17,16 +48,13 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Check portable lockfiles
-        run: |
-          python3 scripts/check-lockfiles.py
-          python3 -B -m unittest discover -s scripts -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/download-artifact@v8
+        with:
+          name: library-lock
+          path: .
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - name: Test and lint the public API and engines
@@ -45,6 +73,7 @@ jobs:
           cargo check --locked -p day-persistence --no-default-features --features driver-rusqlite,system --lib
           cargo test --locked -p day-persistence --no-default-features --features driver-rusqlite,cipher --test cipher
   demo:
+    needs: dependencies
     uses: daybrite/actions/.github/workflows/dayapp.yml@v1
     permissions:
       contents: write
@@ -52,6 +81,9 @@ jobs:
       id-token: write
     with:
       project-path: demo
+      update-day-deps: true
+      day-revision: ${{ needs.dependencies.outputs.revision }}
+      day-version: ${{ needs.dependencies.outputs.revision }}
       targets: all
       scripts: auto
       preflight-checks: fmt, clippy, test

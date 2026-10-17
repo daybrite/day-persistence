@@ -59,6 +59,26 @@ paths for your layout (a sibling `day/` uses `../day/crates/...`).
 Do not commit machine-specific paths. The checked-in demo deliberately depends on this
 repository's crate by relative path, so its CI tests the exact checkout.
 
+Local patches also rewrite `Cargo.lock` and `demo/Cargo.lock`: external Day packages lose
+their Git sources and unused local patches can appear in the locks. These lockfiles work
+with the local configuration but fail CI's `--locked` checks. Before staging them, regenerate
+them in a clean checkout without local Cargo patches (including parent/global configuration),
+and run the locked test and lint commands there. If only local experimentation changed a
+lockfile, restore its last Git-backed version instead of updating dependencies unnecessarily.
+
+Enable the staged-lockfile guard once per clone (requires Python 3.11 or newer):
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+If you already use a hooks directory, call `python3 scripts/check-lockfiles.py --staged`
+from its pre-commit hook instead of replacing it. The guard reads both lockfiles from Git's
+index, permits this repository's own path dependencies, and rejects external local-path
+dependencies and unused local patches. It never rewrites or stages files. Run
+`python3 scripts/check-lockfiles.py` to check the working files; CI runs this check too, since
+hooks are opt-in and can be bypassed. This guard complements Cargo's full `--locked` validation.
+
 ## Initial publication
 
 Only imported history exists in Git until the extraction is committed. That historical tip

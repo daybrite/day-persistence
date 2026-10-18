@@ -344,6 +344,31 @@ impl DatabaseWorker {
         })
     }
 
+    /// Commit a wholesale replacement and discard obsolete undo/redo history only on success.
+    /// Both actions run on the owning queue, so no edit can interleave between them. A failed
+    /// replacement restores the previous history and rolls back the database transaction.
+    pub fn write_resetting_undo<R: Send + 'static>(
+        &self,
+        write: impl FnOnce(&ModelContainer) -> Result<R, DbError> + Send + 'static,
+    ) -> WorkerRequest<R> {
+        self.submit(false, move |session| {
+            let checkpoint = session.undo.as_ref().map(|undo| undo.checkpoint());
+            let result = session
+                .db
+                .worker_write(|db| day_model::with_author("reset", || write(db)));
+            if result.is_ok() {
+                if let Some(undo) = &session.undo {
+                    undo.clear();
+                }
+                session.revision += 1;
+                session.needs_publish = true;
+            } else if let (Some(undo), Some(checkpoint)) = (&session.undo, checkpoint) {
+                undo.restore_checkpoint(checkpoint);
+            }
+            result
+        })
+    }
+
     /// Install one queue-confined history. Call once before editing. Background imports should
     /// use `day_model::with_author` inside `write` so they do not enter user undo history.
     pub fn enable_undo(&self, levels: usize) -> WorkerRequest<()> {

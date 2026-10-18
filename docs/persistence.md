@@ -963,3 +963,11 @@ SQLite drivers, including browser memory and OPFS connections. Aliases are prese
 worker protocol also retains column names for an empty result. The Persistence Lab console
 uses this API to display arbitrary query results as JSON. Worker protocol tests cover aliases,
 bound parameters, and empty results; the demo dayscript checks both memory and durable queries.
+
+### Replacing a worker store's contents
+
+`DatabaseWorker::write_resetting_undo` runs a replacement inside the ordinary atomic worker
+transaction and clears undo/redo only after success, on the same queue. Use it for a deliberate
+local-data reset or authoritative reimport: old undo commands must not resurrect discarded
+records or replay them into the new dataset. A failed replacement rolls back its writes and
+preserves the previous history. Observers receive the committed replacement normally.

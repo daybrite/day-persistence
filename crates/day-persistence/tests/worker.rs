@@ -989,3 +989,37 @@ fn normal_close_and_panic_both_drop_connections_on_worker() {
         );
     }
 }
+
+#[test]
+fn wholesale_reset_clears_history_only_after_successful_commit() {
+    let w = open();
+    block_on(w.enable_undo(10)).unwrap();
+    block_on(w.write(|db| {
+        db.insert(note(1));
+        Ok(())
+    }))
+    .unwrap();
+    assert!(
+        block_on(w.write_resetting_undo::<()>(|db| {
+            db.delete::<Note>(1u64)?;
+            Err(DbError::driver("synthetic reset failure"))
+        }))
+        .is_err()
+    );
+    assert_eq!(count(&w), 1);
+    assert_eq!(block_on(w.undo_status()).unwrap(), (true, false));
+    assert!(block_on(w.undo(false)).unwrap());
+    assert!(block_on(w.undo(true)).unwrap());
+    block_on(w.write_resetting_undo(|db| db.delete::<Note>(1u64))).unwrap();
+    assert_eq!(count(&w), 0);
+    assert_eq!(block_on(w.undo_status()).unwrap(), (false, false));
+    assert!(!block_on(w.undo(false)).unwrap());
+    block_on(w.write(|db| {
+        db.insert(note(2));
+        Ok(())
+    }))
+    .unwrap();
+    assert!(block_on(w.undo(false)).unwrap());
+    assert_eq!(count(&w), 0);
+    block_on(w.close()).unwrap();
+}

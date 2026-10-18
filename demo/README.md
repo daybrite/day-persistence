@@ -29,7 +29,7 @@ web host. Closing/reopening the same name demonstrates durability.
 cargo test --lib
 day launch -t macos-appkit --script dayscript/demo.yaml
 # Use the same script with ios-uikit, android-mdc, linux-gtk, linux-qt,
-# windows-winui, windows-xaml, harmony-arkui, or web-dom (and macOS GTK/Qt).
+# windows-winui, harmony-arkui, or web-dom (and macOS GTK/Qt).
 ```
 
 The dayscript has no platform skips. It checks typed edits, direct SQL, validated JSON import,

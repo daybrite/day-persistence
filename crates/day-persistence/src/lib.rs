@@ -1168,6 +1168,8 @@ pub(crate) struct ContainerInner {
     /// Soft per-table bound on resident rows. Dirty and observed rows never evict, so the
     /// working set can exceed it; everything else does not.
     cache_limit: Cell<usize>,
+    /// Retry eviction after growth when dirty/observed rows prevent reaching the limit.
+    eviction_retry: RefCell<HashMap<u64, usize>>,
     /// The last autosave failure, observable by the UI (`when(container.last_error()…)`).
     pub(crate) error: day_reactive::Signal<Option<String>>,
     /// Guards re-entrant flushes (a turn-end firing during an explicit save).
@@ -1225,6 +1227,7 @@ impl ModelContainer {
                 autosave: Cell::new(true),
                 worker_transaction: Cell::new(false),
                 cache_limit: Cell::new(DEFAULT_CACHE_LIMIT),
+                eviction_retry: RefCell::new(HashMap::new()),
                 error,
                 flushing: Cell::new(false),
             }),
@@ -1343,6 +1346,8 @@ impl ModelContainer {
         self.inner.flushing.set(false);
         match &result {
             Ok(stmts) => {
+                // Previously dirty rows can now be evicted on the next fault.
+                self.inner.eviction_retry.borrow_mut().clear();
                 self.inner.error.set_if_changed(None);
                 self.run_deferred_requeries(stmts);
             }
@@ -1526,9 +1531,25 @@ impl ModelContainer {
         } else {
             (limit / 8).clamp(64, 4096)
         };
-        if resident_len <= limit + slack {
+        let threshold = if strict {
+            limit
+        } else {
+            self.inner
+                .eviction_retry
+                .borrow()
+                .get(&store_id)
+                .copied()
+                .unwrap_or_else(|| limit.saturating_add(slack))
+        };
+        if resident_len <= threshold {
             return;
         }
+        // Back off even when every row is pinned. A fixed limit gate otherwise scans an
+        // ever-growing dirty transaction on EVERY single-row fault (quadratic work).
+        self.inner.eviction_retry.borrow_mut().insert(
+            store_id,
+            resident_len.saturating_add(slack.max(resident_len / 8).max(1)),
+        );
         let resident = {
             let tables = self.inner.tables.borrow();
             match tables.get(&store_id) {
@@ -1548,7 +1569,14 @@ impl ModelContainer {
                 .filter(|key| !protect.contains(key) && !dirty.rows.contains_key(&(store_id, *key)))
                 .collect()
         };
-        evict(&candidates, excess);
+        let evicted = evict(&candidates, excess);
+        let remaining = resident_len.saturating_sub(evicted);
+        self.inner.eviction_retry.borrow_mut().insert(
+            store_id,
+            remaining
+                .max(limit)
+                .saturating_add(slack.max(remaining / 8).max(1)),
+        );
     }
 
     // --- internals ---------------------------------------------------------------------------
@@ -4396,3 +4424,6 @@ pub mod datetime {
         }
     }
 }
+
+#[cfg(all(test, feature = "driver-rusqlite"))]
+mod eviction_tests;

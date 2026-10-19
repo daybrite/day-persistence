@@ -250,7 +250,12 @@ materializes first so the history can restore it). The cache is bounded:
 `set_cache_limit(rows)` (default `DEFAULT_CACHE_LIMIT`, 8192 per model) evicts the oldest
 clean rows past the limit, sparing anything dirty and anything a binding still observes;
 evicted rows fault back on the next read. A row deleted this turn does not resurrect through
-a fault, even though the file still holds it until the flush.
+a fault, even though the file still holds it until the flush. Eviction passes are amortized
+over cache growth, including when dirty or observed rows prevent reaching the bound. After
+an unsuccessful pass, the next pass waits for proportional growth instead of scanning the
+whole pinned cache on each fault. Saving clears that backoff because dirty rows are now
+eligible; explicitly setting the limit always forces a pass. The regression in
+`src/eviction_tests.rs` counts scanned keys across a transaction larger than its cache.
 
 A document container (a sketch whose canvas draws the whole scene) says so explicitly:
 `set_cache_limit(usize::MAX)` then `warm::<M>()` per model at open. The file-sized working

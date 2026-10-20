@@ -10,7 +10,7 @@ use day_model::{Keyed, Op, Store};
 use day_persistence::{Model, ModelContainer, Sqlite, schema};
 use day_pieces::prelude::*;
 use day_reactive::flush_sync;
-use day_spec::{Size, WindowOptions};
+use day_spec::WindowOptions;
 
 #[derive(Model, Clone, Default, PartialEq, Debug)]
 #[model(table = "rows")]
@@ -25,11 +25,7 @@ fn boot(root: impl FnOnce() -> AnyPiece + 'static) -> day_mock::MockProbe {
     let (mock, probe) = day_mock::MockToolkit::new();
     day_core::launch_with(
         mock,
-        WindowOptions {
-            title: "t".into(),
-            size: Size::new(400.0, 600.0),
-            ..Default::default()
-        },
+        WindowOptions::default().title("t").size(400.0, 600.0),
         root,
     );
     probe
@@ -211,8 +207,7 @@ fn a_query_backed_list_takes_a_native_move_as_its_echo() {
             label(move || slot.id().read().to_string())
         })
         .row_height(RowHeight::Uniform(40.0))
-        .reorderable(true)
-        .on_reorder(write_ranks)
+        .reorderable(Reorder::new(write_ranks))
         .any()
     });
     flush_sync();

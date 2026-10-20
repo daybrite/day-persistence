@@ -17,12 +17,7 @@ day::routes! {
 
 /// App identity and translations are supplied before the first UI is constructed.
 pub fn window() -> day::WindowOptions {
-    day::WindowOptions {
-        locales: Some((res::locales::DEFAULT, res::locales::CATALOG)),
-        title_fn: Some(|| res::str::app_title().format()),
-        size: Size::new(1000.0, 760.0),
-        ..Default::default()
-    }
+    res::window_options().size(1000.0, 760.0)
 }
 
 #[derive(Clone)]

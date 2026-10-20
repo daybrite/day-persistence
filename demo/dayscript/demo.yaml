@@ -2,27 +2,27 @@
 flow:
   - wait_for: { id: nav }
   - navigate: { route: database }
-  - tap: { id: open-memory }
+  - tap: { id: open_memory }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: records }
-  - input: { id: note-id, text: "7" }
-  - input: { id: note-title, text: "Synthetic fixture" }
-  - toggle: { id: note-done, value: true }
-  - tap: { id: save-note }
+  - input: { id: note_id, text: "7" }
+  - input: { id: note_title, text: "Synthetic fixture" }
+  - toggle: { id: note_done, value: true }
+  - tap: { id: save_note }
   - assert_text: { id: status, key: operation_ok }
-  - assert_text: { id: record-count, text: "1" }
+  - assert_text: { id: record_count, text: "1" }
   - screenshot: typed-records
   - a11y_audit: {}
 
   - navigate: { route: sql }
-  - input: { id: sql-input, text: "UPDATE notes SET title='SQL fixture' WHERE id=7" }
-  - tap: { id: run-statements }
+  - input: { id: sql_input, text: "UPDATE notes SET title='SQL fixture' WHERE id=7" }
+  - tap: { id: run_statements }
   - assert_text: { id: status, key: operation_ok }
-  - input: { id: sql-input, text: "SELECT title FROM notes WHERE id=7" }
-  - tap: { id: run-query }
+  - input: { id: sql_input, text: "SELECT title FROM notes WHERE id=7" }
+  - tap: { id: run_query }
   - assert_text: { id: status, key: operation_ok }
   - assert_text:
-      id: sql-results
+      id: sql_results
       text: |-
         [
           {
@@ -32,9 +32,9 @@ flow:
   - screenshot: sql-console
 
   - navigate: { route: exchange }
-  - tap: { id: export-json }
+  - tap: { id: export_json }
   - assert_text:
-      id: exchange-json
+      id: exchange_json
       text: |-
         [
           {
@@ -44,60 +44,60 @@ flow:
           }
         ]
   - navigate: { route: records }
-  - tap: { id: delete-note }
-  - assert_text: { id: record-count, text: "0" }
+  - tap: { id: delete_note }
+  - assert_text: { id: record_count, text: "0" }
   - navigate: { route: exchange }
-  - tap: { id: import-json }
+  - tap: { id: import_json }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: records }
-  - assert_text: { id: record-count, text: "1" }
+  - assert_text: { id: record_count, text: "1" }
   - navigate: { route: exchange }
-  - input: { id: exchange-json, text: '[{"id":1,"title":"a","done":false},{"id":1,"title":"b","done":true}]' }
-  - tap: { id: import-json }
+  - input: { id: exchange_json, text: '[{"id":1,"title":"a","done":false},{"id":1,"title":"b","done":true}]' }
+  - tap: { id: import_json }
   - assert_text: { id: status, key: invalid_import_ids }
   - navigate: { route: records }
-  - assert_text: { id: record-count, text: "1" }
+  - assert_text: { id: record_count, text: "1" }
 
   # The SQL log sits under every page and gains each statement as it runs.
   - navigate: { route: database }
-  - tap: { id: clear-log }
-  - assert_visible: { id: sql-log-empty }
+  - tap: { id: clear_log }
+  - assert_visible: { id: sql_log_empty }
   - tap: { id: integrity }
   - assert_text: { id: status, key: operation_ok }
-  - assert_visible: { id: sql-log }
+  - assert_visible: { id: sql_log }
   - tap: { id: vacuum }
   - assert_text: { id: status, key: operation_ok }
   - screenshot: sql-log
-  - toolbar: { item: toggle-console, on: false }
+  - toolbar: { item: toggle_console, on: false }
   - assert_text: { id: status, key: operation_ok }
   - screenshot: console-hidden
-  - toolbar: { item: toggle-console, on: true }
-  - assert_visible: { id: sql-log }
+  - toolbar: { item: toggle_console, on: true }
+  - assert_visible: { id: sql_log }
 
   # Reopen a dedicated named database, never a developer's exploratory database.
   - navigate: { route: database }
-  - input: { id: database-name, text: "lab-script.sqlite" }
-  - tap: { id: open-durable }
+  - input: { id: database_name, text: "lab-script.sqlite" }
+  - tap: { id: open_durable }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: sql }
-  - input: { id: sql-input, text: "DELETE FROM notes" }
-  - tap: { id: run-statements }
+  - input: { id: sql_input, text: "DELETE FROM notes" }
+  - tap: { id: run_statements }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: records }
-  - tap: { id: save-note }
-  - assert_text: { id: record-count, text: "1" }
+  - tap: { id: save_note }
+  - assert_text: { id: record_count, text: "1" }
   - navigate: { route: database }
   - tap: { id: checkpoint }
   - assert_text: { id: status, key: operation_ok }
-  - tap: { id: open-memory }
-  - tap: { id: open-durable }
+  - tap: { id: open_memory }
+  - tap: { id: open_durable }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: sql }
-  - input: { id: sql-input, text: "SELECT count(*) AS total FROM notes" }
-  - tap: { id: run-query }
+  - input: { id: sql_input, text: "SELECT count(*) AS total FROM notes" }
+  - tap: { id: run_query }
   - assert_text: { id: status, key: operation_ok }
   - assert_text:
-      id: sql-results
+      id: sql_results
       text: |-
         [
           {
@@ -105,6 +105,6 @@ flow:
           }
         ]
   - navigate: { route: records }
-  - assert_text: { id: record-count, text: "1" }
-  - tap: { id: delete-note }
-  - assert_text: { id: record-count, text: "0" }
+  - assert_text: { id: record_count, text: "1" }
+  - tap: { id: delete_note }
+  - assert_text: { id: record_count, text: "0" }

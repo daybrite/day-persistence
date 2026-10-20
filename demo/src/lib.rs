@@ -192,7 +192,7 @@ pub fn root() -> AnyPiece {
             .item(Page::Exchange, res::str::nav_exchange(), move || {
                 page(exchange.clone(), exchange_page)
             })
-            .id("nav")
+            .id(day::id!(nav))
             .grow(),
     )
 }
@@ -205,7 +205,9 @@ fn page<P: Piece>(s: Scene, controls: fn(Scene) -> P) -> impl Piece {
     let shown = s.console;
     let alone = s.clone();
     column((
-        label(move || status.get()).id("status").padding(8.0),
+        label(move || status.get())
+            .id(day::id!(status))
+            .padding(8.0),
         when(
             move || shown.get(),
             move || {
@@ -215,7 +217,7 @@ fn page<P: Piece>(s: Scene, controls: fn(Scene) -> P) -> impl Piece {
                 )
                 .axis(SplitAxis::Vertical)
                 .fraction(s.console_share)
-                .id("console-split")
+                .id(day::id!(console_split))
                 .grow()
             },
         )
@@ -223,7 +225,7 @@ fn page<P: Piece>(s: Scene, controls: fn(Scene) -> P) -> impl Piece {
     ))
     .grow()
     .toolbar(
-        toolbar_toggle("toggle-console", res::str::console_toggle(), shown)
+        toolbar_toggle(day::id!(toggle_console), res::str::console_toggle(), shown)
             .image(res::vectors::console)
             .tooltip(res::str::console_toggle_help())
             .placement(ToolbarPlacement::Primary),
@@ -247,7 +249,7 @@ fn console(s: Scene) -> impl Piece {
             spacer(),
             button(res::str::clear_log())
                 .action(move || trace.update(VecDeque::clear))
-                .id("clear-log"),
+                .id(day::id!(clear_log)),
         ))
         .spacing(8.0),
         scroll(
@@ -257,14 +259,14 @@ fn console(s: Scene) -> impl Piece {
                     label(res::str::console_empty())
                         .font(Font::Footnote)
                         .secondary()
-                        .id("sql-log-empty")
+                        .id(day::id!(sql_log_empty))
                 },
             )
             .otherwise(move || {
                 label(move || trace.with(|lines| Vec::from(lines.clone()).join("\n")))
                     .font(Font::Footnote)
                     .monospace()
-                    .id("sql-log")
+                    .id(day::id!(sql_log))
                     .a11y(|a| a.label(res::str::console_title().format()))
             }),
         )
@@ -287,15 +289,15 @@ fn database_page(s: Scene) -> impl Piece {
         labeled(
             res::str::database_name(),
             text_field(s.name)
-                .id("database-name")
+                .id(day::id!(database_name))
                 .a11y(|a| a.label(res::str::database_name().format())),
         ),
         button(res::str::open_memory())
             .action(move || memory.open(false))
-            .id("open-memory"),
+            .id(day::id!(open_memory)),
         button(res::str::open_durable())
             .action(move || durable.open(true))
-            .id("open-durable"),
+            .id(day::id!(open_durable)),
         button(res::str::integrity_check())
             .action(move || {
                 let result = integrity
@@ -312,19 +314,19 @@ fn database_page(s: Scene) -> impl Piece {
                     });
                 integrity.finish(result);
             })
-            .id("integrity"),
+            .id(day::id!(integrity)),
         button(res::str::checkpoint())
             .action(move || {
                 let result = checkpoint.db.borrow().container.checkpoint();
                 checkpoint.finish(result);
             })
-            .id("checkpoint"),
+            .id(day::id!(checkpoint)),
         button(res::str::vacuum())
             .action(move || {
                 let result = vacuum.db.borrow().container.vacuum();
                 vacuum.finish(result);
             })
-            .id("vacuum"),
+            .id(day::id!(vacuum)),
     ))
     .spacing(12.0)
 }
@@ -339,39 +341,39 @@ fn records_page(s: Scene) -> impl Piece {
         labeled(
             res::str::note_id(),
             text_field(s.id)
-                .id("note-id")
+                .id(day::id!(note_id))
                 .a11y(|a| a.label(res::str::note_id().format())),
         ),
         labeled(
             res::str::note_title(),
             text_field(s.title)
-                .id("note-title")
+                .id(day::id!(note_title))
                 .a11y(|a| a.label(res::str::note_title().format())),
         ),
         labeled(
             res::str::note_done(),
             toggle(s.done)
-                .id("note-done")
+                .id(day::id!(note_done))
                 .a11y(|a| a.label(res::str::note_done().format())),
         ),
         button(res::str::save_note())
             .action(move || save.save_note())
-            .id("save-note"),
+            .id(day::id!(save_note)),
         button(res::str::delete_note())
             .action(move || delete.delete_note())
-            .id("delete-note"),
+            .id(day::id!(delete_note)),
         button(res::str::refresh())
             .action(move || reload.finish(Ok(())))
-            .id("refresh-records"),
+            .id(day::id!(refresh_records)),
         labeled(
             res::str::record_count(),
             label(move || count.get())
-                .id("record-count")
+                .id(day::id!(record_count))
                 .a11y(|a| a.label(res::str::record_count().format())),
         ),
         text_area(s.records)
             .editable(false)
-            .id("records")
+            .id(day::id!(records))
             .height(180.0)
             .a11y(|a| a.label(res::str::records_result().format())),
     ))
@@ -385,7 +387,7 @@ fn sql_page(s: Scene) -> impl Piece {
         label(res::str::sql_help()).max_width(640.0),
         text_area(s.sql)
             .spellcheck(false)
-            .id("sql-input")
+            .id(day::id!(sql_input))
             .height(120.0)
             .a11y(|a| a.label(res::str::sql_input().format())),
         button(res::str::run_query())
@@ -397,16 +399,16 @@ fn sql_page(s: Scene) -> impl Piece {
                     .map(|out| query.results.set(out));
                 query.finish(result);
             })
-            .id("run-query"),
+            .id(day::id!(run_query)),
         button(res::str::run_statements())
             .action(move || {
                 let result = execute.db.borrow().execute(&execute.sql.get_untracked());
                 execute.finish(result);
             })
-            .id("run-statements"),
+            .id(day::id!(run_statements)),
         text_area(s.results)
             .editable(false)
-            .id("sql-results")
+            .id(day::id!(sql_results))
             .height(220.0)
             .a11y(|a| a.label(res::str::sql_result().format())),
     ))
@@ -425,15 +427,15 @@ fn exchange_page(s: Scene) -> impl Piece {
                     .map(|()| export.exchange.set(export.records.get_untracked()));
                 export.finish(result);
             })
-            .id("export-json"),
+            .id(day::id!(export_json)),
         text_area(s.exchange)
             .spellcheck(false)
-            .id("exchange-json")
+            .id(day::id!(exchange_json))
             .height(220.0)
             .a11y(|a| a.label(res::str::exchange_json().format())),
         button(res::str::import_json())
             .action(move || import.import())
-            .id("import-json"),
+            .id(day::id!(import_json)),
     ))
     .spacing(12.0)
 }

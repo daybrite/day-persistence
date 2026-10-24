@@ -387,7 +387,7 @@ Implement it on a unit struct and select it per field with `#[model(with = …)]
 is sugar for the built-in `Json` codec. `Option` handling belongs to the framework: an impl
 never sees `NULL` and cannot disagree about it.
 
-The `datetime` feature adds the impls for [day-piece-datetime](https://daybrite.dev/docs/internal/datepicker/)'s types:
+The `datetime` feature adds the impls for [day::datetime](https://daybrite.dev/docs/internal/datepicker/)'s types:
 `DayDate` and `DayTime` canonically as `INTEGER` (epoch days, seconds-of-day), plus the
 `day_persistence::datetime` codecs `Iso8601` (`TEXT`, lexicographic order is chronological
 order), `EpochSeconds` and `EpochMillis` for interop that expects Unix time. They live in this
@@ -952,7 +952,7 @@ What it takes from the framework:
 | `day-async` | `oneshot` | `DatabaseWorker` replies |
 | `day-macros` | `observable_impls!` | the observable half of `#[derive(Model)]` |
 | `day-pieces`, `day-spec` (feature `pieces`) | `RowSource`, `RowConn`, `ModelSlot`, `props::RowDelta` | `list(query, row)` |
-| `day-piece-datetime` (feature `datetime`) | `DayDate`, `DayTime` | the date and time codecs |
+| `day::datetime` (feature `datetime`) | `DayDate`, `DayTime` | the date and time codecs |
 | the web-dom host | `[package.metadata.day.web]` | staging the engine's browser half |
 
 `#[derive(Model)]` generates its schema half itself and hands the observable half to

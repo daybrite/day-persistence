@@ -7,7 +7,7 @@
 
 use day_persistence::datetime::{EpochMillis, EpochSeconds, Iso8601};
 use day_persistence::{ColumnValue, Value, ValueCodec};
-use day_piece_datetime::{DayDate, DayTime};
+use day_spec::controls::datetime::{DayDate, DayTime};
 
 /// Round-trip identity for every codec, and order agreement for the ones that sort.
 #[test]

@@ -20,7 +20,6 @@ day-reactive = { git = "https://github.com/daybrite/day.git" }
 day-macros = { git = "https://github.com/daybrite/day.git" }
 day-pieces = { git = "https://github.com/daybrite/day.git" }
 day-spec = { git = "https://github.com/daybrite/day.git" }
-day-piece-datetime = { git = "https://github.com/daybrite/day.git" }
 day-core = { git = "https://github.com/daybrite/day.git" }
 day-mock = { git = "https://github.com/daybrite/day.git" }
 serde = { version = "1", features = ["derive"] }

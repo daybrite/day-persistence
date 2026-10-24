@@ -26,9 +26,9 @@ system = []
 cipher = ["rusqlite?/bundled-sqlcipher-vendored-openssl"]
 # `list(query, row)`: Query as a day-pieces row source, emitting animatable row deltas.
 pieces = ["dep:day-pieces", "dep:day-spec"]
-# Column codecs for day-piece-datetime's `DayDate` and `DayTime` (docs/persistence.md): the
+# Column codecs for day::datetime's `DayDate` and `DayTime` (docs/persistence.md): the
 # canonical `INTEGER` forms plus the `datetime::{Iso8601, EpochSeconds, EpochMillis}` codecs.
-datetime = ["dep:day-piece-datetime"]
+datetime = ["dep:day-spec"]
 
 [dependencies]
 day-async = { workspace = true }
@@ -40,7 +40,6 @@ day-persistence-macros = { workspace = true }
 day-macros = { workspace = true }
 day-pieces = { workspace = true, features = ["model"], optional = true }
 day-spec = { workspace = true, optional = true }
-day-piece-datetime = { workspace = true, optional = true }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

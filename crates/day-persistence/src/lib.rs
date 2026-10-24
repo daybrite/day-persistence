@@ -4329,8 +4329,8 @@ pub use pieces_glue::QueryConn;
 // Date and time codecs (feature `datetime`; docs/persistence.md)
 // ---------------------------------------------------------------------------
 
-/// Column codecs for day-piece-datetime's [`DayDate`](day_piece_datetime::DayDate) and
-/// [`DayTime`](day_piece_datetime::DayTime), for `#[derive(Model)]` fields.
+/// Column codecs for day::datetime's [`DayDate`](day_spec::controls::datetime::DayDate) and
+/// [`DayTime`](day_spec::controls::datetime::DayTime), for `#[derive(Model)]` fields.
 ///
 /// Canonical, what a bare field of the type stores: `DayDate` → `INTEGER` epoch days,
 /// `DayTime` → `INTEGER` seconds-of-day: the same numeric interchange forms the pickers
@@ -4347,7 +4347,7 @@ pub use pieces_glue::QueryConn;
 #[cfg(feature = "datetime")]
 pub mod datetime {
     use crate::{ColumnValue, DbError, DbErrorKind, SqlType, Value, ValueCodec};
-    use day_piece_datetime::{DayDate, DayTime};
+    use day_spec::controls::datetime::{DayDate, DayTime};
 
     impl ColumnValue for DayDate {
         const SQL_TYPE: SqlType = SqlType::Integer;

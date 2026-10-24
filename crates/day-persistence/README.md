@@ -50,7 +50,7 @@ animates changes to the result set.
 | `system` | | Links the operating system's libsqlite3. Turn `bundled` off with `default-features = false`. |
 | `cipher` | | Builds SQLCipher with vendored crypto, for `.key(Secret)`. |
 | `pieces` | yes | `list(query, row)`: a query as a day-pieces row source. |
-| `datetime` | | Column codecs for day-piece-datetime's `DayDate` and `DayTime`. |
+| `datetime` | | Column codecs for day::datetime's `DayDate` and `DayTime`. |
 
 A crate that only implements a codec or a driver depends on it with
 `default-features = false`, which compiles the traits and the `Recorder` without an engine.

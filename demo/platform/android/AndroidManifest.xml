@@ -3,7 +3,7 @@
     App-owned Android manifest overlay. Day merges this with its generated manifest
     and dependency contributions; keep only your customizations here. You may delete
     this file to use Day's defaults. It does not require a checked-in Gradle project.
-    Guide: https://daybrite.dev/docs/platforms/android-mdc#manifest-customization
+    Guide: https://daybrite.dev/docs/platforms/android-material#manifest-customization
 
     Keep app identity, version, window sizes, and portable permissions in Day.toml:
     https://daybrite.dev/docs/project-structure/

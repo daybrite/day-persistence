@@ -53,9 +53,9 @@ impl Sqlite {
     }
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     /// The database named `name` in the per-app data directory, created if missing. The
-    /// directory follows the day-part-fs root rules (docs/fs.md): `DAY_DATA_DIR` when the
+    /// directory follows the day-part-filesystem root rules (docs/fs.md): `DAY_DATA_DIR` when the
     /// host passes one (the Android and OpenHarmony hosts do), the platform's app-data
-    /// convention otherwise, and a `day-db/` leaf of its own beside day-part-fs' `day-fs/`.
+    /// convention otherwise, and a `day-db/` leaf of its own beside day-part-filesystem' `day-fs/`.
     /// `name` is a file name, not a path. Errs where no such directory exists (web has no
     /// filesystem; keep a wasm build on [`Sqlite::memory`] or its own driver).
     pub fn app_data(name: impl AsRef<str>) -> Result<Self, DbError> {
@@ -306,7 +306,7 @@ impl SqliteDriver for Sqlite {
     }
 }
 
-/// The `day-db/` sibling of day-part-fs' root: same resolution order, its own leaf, so the
+/// The `day-db/` sibling of day-part-filesystem' root: same resolution order, its own leaf, so the
 /// database never collides with other day state in the directory.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn app_data_root() -> Result<std::path::PathBuf, DbError> {

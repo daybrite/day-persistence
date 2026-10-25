@@ -44,7 +44,7 @@ skips and three screenshots, on each of:
 - macos-gtk
 - macos-qt
 - ios-uikit (one explicit booted simulator)
-- android-mdc (one explicit emulator)
+- android-material (one explicit emulator)
 - web-dom (Playwright driver, including OPFS reopening and named-column queries)
 
 HarmonyOS Rust compilation and HAP packaging/signing passed. This host required

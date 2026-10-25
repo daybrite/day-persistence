@@ -272,7 +272,7 @@ onmessage = async (e) => {
     B = new Uint8Array(sab, DATA_OFF);
     CAP = B.length;
     // Stub every UI-shaped import: this instance only ever runs the engine path. Time and
-    // entropy stay real under both the engine's names and day-dom's, whose `getrandom` bridge
+    // entropy stay real under both the engine's names and day-toolkit-dom's, whose `getrandom` bridge
     // is linked into the same module.
     const now = () => Date.now();
     const entropy = (p, n) => crypto.getRandomValues(new Uint8Array(wasm.memory.buffer, p, n));

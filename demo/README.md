@@ -28,7 +28,7 @@ web host. Closing/reopening the same name demonstrates durability.
 ```sh
 cargo test --lib
 day launch -t macos-appkit --script dayscript/demo.yaml
-# Use the same script with ios-uikit, android-mdc, linux-gtk, linux-qt,
+# Use the same script with ios-uikit, android-material, linux-gtk, linux-qt,
 # windows-winui, harmony-arkui, or web-dom (and macOS GTK/Qt).
 ```
 

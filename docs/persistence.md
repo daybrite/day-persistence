@@ -320,7 +320,7 @@ The container speaks to SQLite through the `SqliteDriver` trait; two drivers are
 file, `Sqlite::memory()` an in-memory database, and `Sqlite::app_data("name.db")` the per-app
 data directory: `DAY_DATA_DIR` when the host passes one (the Android and OpenHarmony hosts do),
 the platform's app-data convention otherwise, under a `day-db/` leaf beside
-[day-part-fs](https://daybrite.dev/docs/internal/fs/)'s `day-fs/`. Builder options: `.key(Secret)` for SQLCipher,
+[day-part-filesystem](https://daybrite.dev/docs/internal/fs/)'s `day-fs/`. Builder options: `.key(Secret)` for SQLCipher,
 `.cipher_migrate()` to accept an older cipher generation, `.wal(false)` to opt out of WAL, and
 `.with_init(|conn| …)`, a hook over the raw rusqlite connection for loadable extensions,
 custom SQL functions, and PRAGMAs the crate does not model.

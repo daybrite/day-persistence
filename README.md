@@ -6,7 +6,7 @@ reactivity and piece APIs; Day does not depend on persistence.
 
 ```toml
 [dependencies]
-day = { git = "https://github.com/daybrite/day.git", features = ["model"] }
+day = { package = "day-app", git = "https://github.com/daybrite/day.git", features = ["model"] }
 day-persistence = { git = "https://github.com/daybrite/day-persistence.git", version = "0.1" }
 ```
 
@@ -54,7 +54,7 @@ this parent configuration for `demo/`, too. For example:
 
 ```toml
 [patch."https://github.com/daybrite/day.git"]
-day = { path = "../day/crates/day" }
+day-app = { path = "../day/crates/day" }
 day-build = { path = "../day/crates/day-build" }
 day-model = { path = "../day/crates/day-model" }
 # Repeat for the other Day dependencies in [workspace.dependencies].

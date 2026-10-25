@@ -12,7 +12,7 @@ statement list at the end of each turn, so twenty keystrokes into one field are 
 
 ```toml
 [dependencies]
-day = { git = "https://github.com/daybrite/day.git", features = ["model"] }
+day = { package = "day-app", git = "https://github.com/daybrite/day.git", features = ["model"] }
 day-persistence = { git = "https://github.com/daybrite/day-persistence.git", version = "0.1" }
 ```
 

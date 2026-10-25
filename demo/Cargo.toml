@@ -24,7 +24,7 @@ mock = ["day/mock"]
 name = "dayapp"
 
 [dependencies]
-day = { git = "https://github.com/daybrite/day.git", features = ["model"] }
+day = { package = "day-app", git = "https://github.com/daybrite/day.git", features = ["model"] }
 day-persistence = { path = "../crates/day-persistence" }
 # JSON is the portable typed-record exchange format.
 serde = { version = "1", features = ["derive"] }

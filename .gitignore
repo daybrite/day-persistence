@@ -2,8 +2,9 @@ target/
 build/
 .cache/
 .DS_Store
-.cargo/config.toml
-# CI resolves current day/main; consuming applications own their lockfiles.
+**/.cargo/config.toml
+# CI resolves day afresh (the newest release, or main on a push); consuming applications own
+# their lockfiles.
 /Cargo.lock
 /demo/Cargo.lock
 !AGENTS.md

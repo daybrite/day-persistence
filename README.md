@@ -6,8 +6,8 @@ reactivity and piece APIs; Day does not depend on persistence.
 
 ```toml
 [dependencies]
-day = { package = "day-app", git = "https://github.com/daybrite/day.git", features = ["model"] }
-day-persistence = { git = "https://github.com/daybrite/day-persistence.git", version = "0.1" }
+day = { package = "day-app", version = "0.6", features = ["model"] }
+day-persistence = "0.1"
 ```
 
 The 0.1 series starts with the persistence API extracted from Day 0.5.1. Choose compatible

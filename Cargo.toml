@@ -14,14 +14,14 @@ description = "Typed SQLite persistence and browser storage for Day apps"
 [workspace.dependencies]
 day-persistence-macros = { path = "crates/day-persistence-macros", version = "=0.1.0" }
 day-sqlite-worker = { path = "crates/day-sqlite-worker", version = "0.1.0" }
-day-async = { git = "https://github.com/daybrite/day.git" }
-day-model = { git = "https://github.com/daybrite/day.git" }
-day-reactive = { git = "https://github.com/daybrite/day.git" }
-day-macros = { git = "https://github.com/daybrite/day.git" }
-day-pieces = { git = "https://github.com/daybrite/day.git" }
-day-spec = { git = "https://github.com/daybrite/day.git" }
-day-core = { git = "https://github.com/daybrite/day.git" }
-day-mock = { git = "https://github.com/daybrite/day.git" }
+day-async = "0.6"
+day-model = "0.6"
+day-reactive = "0.6"
+day-macros = "0.6"
+day-pieces = "0.6"
+day-spec = "0.6"
+day-core = "0.6"
+day-mock = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = "0.40"

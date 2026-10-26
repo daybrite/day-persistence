@@ -27,8 +27,8 @@ It is its own crate, beside the `day` facade rather than behind one of its featu
 depends on both, with the facade's `model` feature on:
 
 ```toml
-day = { package = "day-app", git = "https://github.com/daybrite/day.git", features = ["model"] }
-day-persistence = { git = "https://github.com/daybrite/day-persistence.git" }   # bundled SQLite, the default engine
+day = { package = "day-app", version = "0.6", features = ["model"] }
+day-persistence = "0.1"   # bundled SQLite, the default engine
 ```
 
 The crate's features select the engine: `system` links the OS's libsqlite3 instead of

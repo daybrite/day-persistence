@@ -3,7 +3,6 @@
 
 [package]
 name = "day-sqlite-worker"
-publish = false
 version.workspace = true
 # Edition 2021 because src/bindings.rs is rust-bindgen output (pre-2024 `extern "C"` blocks)
 # vendored from sqlite-wasm-rs, and staying on 2021 means a future regeneration drops in

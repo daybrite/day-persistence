@@ -3,36 +3,45 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      day-main:
+        description: Build against day's main branch instead of the newest release
+        type: boolean
+        default: false
   schedule:
-    # Day can change even when this repository has no new commits.
+    # Nightly, against the newest day release: Day can change even when this repository has no
+    # new commits. A push builds against day's main.
     - cron: "15 7 * * *"
 permissions:
   contents: read
 jobs:
   dependencies:
-    name: Resolve current Day main
+    name: Resolve the Day dependencies
     runs-on: ubuntu-latest
     outputs:
-      revision: ${{ steps.day.outputs.revision }}
+      mode: ${{ steps.day.outputs.mode }}
+      revision: ${{ steps.day.outputs.rev }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve one Day revision and library lock for this run
+      # One resolution for the library jobs and the demo: the newest day release, or day's main
+      # (and every other Day repository's) on a push.
+      - name: Resolve one Day and library lock for this run
         id: day
-        shell: bash
+        uses: daybrite/actions/.github/actions/day-deps@v1
+        with:
+          day-deps: ${{ inputs.day-main && 'main' || 'auto' }}
+      - name: Collect the lock and the patch table
         run: |
           set -euo pipefail
-          revision=$(git ls-remote https://github.com/daybrite/day.git refs/heads/main | awk '{print $1}')
-          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Could not resolve day/main"; exit 1; }
-          cargo generate-lockfile
-          # The library uses day-pieces, not the umbrella day crate; all share one Git source.
-          cargo update -p day-pieces --precise "$revision"
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
-          echo "Library and demo test day/main at $revision" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/library-lock/.cargo"
+          cp Cargo.lock "$RUNNER_TEMP/library-lock/"
+          [ ! -f .cargo/config.toml ] || cp .cargo/config.toml "$RUNNER_TEMP/library-lock/.cargo/"
       - uses: actions/upload-artifact@v7
         with:
           name: library-lock
-          path: Cargo.lock
+          path: ${{ runner.temp }}/library-lock
+          include-hidden-files: true
           if-no-files-found: error
           overwrite: true
           retention-days: 1
@@ -81,9 +90,10 @@ jobs:
       id-token: write
     with:
       project-path: demo
-      update-day-deps: true
-      day-revision: ${{ needs.dependencies.outputs.revision }}
-      day-version: ${{ needs.dependencies.outputs.revision }}
+      # The day the library jobs resolved: the release, or the same day commit.
+      day-deps: ${{ needs.dependencies.outputs.mode == 'main' && needs.dependencies.outputs.revision || needs.dependencies.outputs.mode }}
+      # On a version tag, after every leg passed: the library crates to crates.io.
+      publish-crates: true
       targets: all
       scripts: auto
       preflight-checks: fmt, clippy, test

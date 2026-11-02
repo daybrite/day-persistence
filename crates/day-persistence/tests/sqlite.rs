@@ -20,7 +20,7 @@ struct Note {
 /// A fresh path under the OS temp dir; the test owns it for its lifetime.
 fn temp_db(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-{}-{}.sqlite",
+        "day-persistence-{}-{}.db",
         std::process::id(),
         name
     ));

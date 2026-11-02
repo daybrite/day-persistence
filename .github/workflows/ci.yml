@@ -92,10 +92,26 @@ jobs:
       project-path: demo
       # The day the library jobs resolved: the release, or the same day commit.
       day-deps: ${{ needs.dependencies.outputs.mode == 'main' && needs.dependencies.outputs.revision || needs.dependencies.outputs.mode }}
-      # On a version tag, after every leg passed: the library crates to crates.io.
-      publish-crates: true
       targets: all
       scripts: auto
       preflight-checks: fmt, clippy, test
       publish-release: false
       deploy-web: false
+
+  # On a version tag, once the checks above passed: the crates to crates.io, through
+  # Trusted Publishing (daybrite/actions' publish-crates). It does not wait for the demo legs,
+  # whose emulators and packaging gate the demo's release, not the library's. Each crate's trusted
+  # publisher on crates.io names this repository, ci.yml, and the environment `release`.
+  publish:
+    name: publish (crates.io)
+    needs: [dependencies, library]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: daybrite/actions/.github/actions/publish-crates@v1

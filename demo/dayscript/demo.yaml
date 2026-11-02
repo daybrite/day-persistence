@@ -76,7 +76,7 @@ flow:
 
   # Reopen a dedicated named database, never a developer's exploratory database.
   - navigate: { route: database }
-  - input: { id: database_name, text: "lab-script.sqlite" }
+  - input: { id: database_name, text: "lab-script.db" }
   - tap: { id: open_durable }
   - assert_text: { id: status, key: operation_ok }
   - navigate: { route: sql }

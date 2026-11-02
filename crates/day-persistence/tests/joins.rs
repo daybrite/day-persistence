@@ -52,7 +52,7 @@ struct Reading {
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-join-{}-{}.sqlite",
+        "day-persistence-join-{}-{}.db",
         std::process::id(),
         name
     ));

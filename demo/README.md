@@ -34,7 +34,7 @@ day launch -t macos-appkit --script dayscript/demo.yaml
 
 The dayscript has no platform skips. It checks typed edits, direct SQL, validated JSON import,
 export/delete/import restoration, maintenance, the live SQL log and its toggle, and reopening
-a named fixture database. It uses only `lab-script.sqlite` for durable tests and removes its
+a named fixture database. It uses only `lab-script.db` for durable tests and removes its
 notes on completion. CI runs it on the declared targets; local HarmonyOS emulator testing is
 intentionally excluded.
 

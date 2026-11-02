@@ -39,7 +39,7 @@ struct Favorite {
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-attached-{}-{name}.sqlite",
+        "day-persistence-attached-{}-{name}.db",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);

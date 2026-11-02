@@ -218,10 +218,8 @@ mod tests {
 
     #[test]
     fn named_database_survives_reopen() {
-        let path = std::env::temp_dir().join(format!(
-            "persistence-lab-test-{}.sqlite",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("persistence-lab-test-{}.db", std::process::id()));
         {
             let db = open(Sqlite::at(&path));
             db.save_note(Note {

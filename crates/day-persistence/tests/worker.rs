@@ -543,7 +543,7 @@ fn temporary_db(test: &str) -> std::path::PathBuf {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join("test.sqlite")
+    dir.join("test.db")
 }
 #[test]
 fn acknowledged_commits_survive_reopen_and_panics_do_not_leave_partial_writes() {
@@ -850,7 +850,9 @@ impl Drop for FaultConnection {
 impl day_persistence::SqliteDriver for FaultDriver {
     type Connection = FaultConnection;
     fn capabilities(&self) -> day_persistence::Capabilities {
-        Sqlite::memory().capabilities()
+        let mut caps = Sqlite::memory().capabilities();
+        caps.external_changes = true;
+        caps
     }
     fn open(self) -> Result<Self::Connection, DbError> {
         Ok(FaultConnection {
@@ -876,6 +878,18 @@ impl day_persistence::SqliteConnection for FaultConnection {
         row: &mut dyn FnMut(&dyn day_persistence::Row),
     ) -> Result<(), DbError> {
         assert_eq!(self.owner, std::thread::current().id());
+        if self
+            .fail
+            .compare_exchange(
+                3,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Err(DbError::driver("synthetic post-commit refresh failure"));
+        }
         self.inner.query(sql, params, row)
     }
     fn execute_batch(&mut self, sql: &str) -> Result<(), DbError> {
@@ -1022,4 +1036,345 @@ fn wholesale_reset_clears_history_only_after_successful_commit() {
     assert!(block_on(w.undo(false)).unwrap());
     assert_eq!(count(&w), 0);
     block_on(w.close()).unwrap();
+}
+
+#[test]
+fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_atomically() {
+    use day_persistence::{SqliteConnection, TransactionParticipant, Value, WriteOrigin};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Audit(Arc<AtomicBool>);
+    impl TransactionParticipant for Audit {
+        fn begin(&self, c: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
+            c.execute("INSERT INTO audit_begin VALUES(1)", &[])?;
+            Ok(())
+        }
+        fn before_commit(
+            &self,
+            c: &mut dyn SqliteConnection,
+            origin: WriteOrigin,
+        ) -> Result<(), DbError> {
+            c.execute(
+                "INSERT INTO audit SELECT count(*),? FROM notes",
+                &[Value::Text(format!("{origin:?}"))],
+            )?;
+            if self.0.load(Ordering::SeqCst) {
+                return Err(DbError::driver("synthetic participant failure"));
+            }
+            Ok(())
+        }
+    }
+    let fail = Arc::new(AtomicBool::new(false));
+    let hook = fail.clone();
+    let w = block_on(DatabaseWorker::open(move || {
+        let db = ModelContainer::open(Sqlite::memory(), schema![Note])?;
+        db.try_with_connection(|c| {
+            c.execute_batch(
+                "CREATE TABLE audit(n INTEGER,origin TEXT); CREATE TABLE audit_begin(n INTEGER);",
+            )
+        })?;
+        db.install_transaction_participant(Audit(hook))?;
+        Ok(db)
+    }))
+    .unwrap();
+    block_on(w.write(|db| {
+        let signal = day_reactive::Signal::new(false);
+        let target = db.clone();
+        day_reactive::watch(
+            move || signal.get(),
+            move |ready, _| {
+                if *ready {
+                    target.insert(note(2));
+                }
+            },
+        );
+        db.insert(note(1));
+        db.save()?;
+        db.insert(note(3));
+        signal.set(true);
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(count(&w), 3);
+    let audit = block_on(w.read(|db| {
+        db.try_with_connection(|c| {
+            let mut out = vec![];
+            c.query("SELECT n,origin FROM audit", &[], &mut |r| {
+                out.push((r.get(0), r.get(1)))
+            })?;
+            Ok(out)
+        })
+    }))
+    .unwrap();
+    assert_eq!(audit, vec![(Value::Int(3), Value::Text("Local".into()))]);
+    fail.store(true, Ordering::SeqCst);
+    assert!(
+        block_on(w.write(|db| {
+            db.insert(note(4));
+            Ok(())
+        }))
+        .is_err()
+    );
+    assert_eq!(count(&w), 3);
+    fail.store(false, Ordering::SeqCst);
+    block_on(w.write_with_origin(WriteOrigin::RemoteImport, |db| {
+        db.insert(note(5));
+        Ok(())
+    }))
+    .unwrap();
+    block_on(w.read(|db| {
+        db.try_with_connection(|c| {
+            let mut rows = vec![];
+            c.query("SELECT n,origin FROM audit", &[], &mut |r| {
+                rows.push((r.get(0), r.get(1)))
+            })?;
+            assert_eq!(
+                rows,
+                vec![
+                    (Value::Int(3), Value::Text("Local".into())),
+                    (Value::Int(4), Value::Text("RemoteImport".into()))
+                ]
+            );
+            c.query("SELECT count(*) FROM audit_begin", &[], &mut |r| {
+                assert_eq!(r.get(0), Value::Int(2))
+            })?;
+            Ok(())
+        })
+    }))
+    .unwrap();
+    block_on(w.close()).unwrap();
+}
+
+#[test]
+fn failed_participant_admission_rollback_closes_the_worker() {
+    struct Reject;
+    impl day_persistence::TransactionParticipant for Reject {
+        fn begin(
+            &self,
+            _: &mut dyn day_persistence::SqliteConnection,
+            _: day_persistence::WriteOrigin,
+        ) -> Result<(), DbError> {
+            Err(DbError::driver("synthetic admission failure"))
+        }
+        fn before_commit(
+            &self,
+            _: &mut dyn day_persistence::SqliteConnection,
+            _: day_persistence::WriteOrigin,
+        ) -> Result<(), DbError> {
+            unreachable!()
+        }
+    }
+    let fail = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let flag = fail.clone();
+    let (tx, rx) = mpsc::channel();
+    let w = block_on(DatabaseWorker::open(move || {
+        let db = ModelContainer::open(
+            FaultDriver {
+                fail: flag,
+                dropped: tx,
+            },
+            schema![Note],
+        )?;
+        db.install_transaction_participant(Reject)?;
+        Ok(db)
+    }))
+    .unwrap();
+    fail.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        block_on(w.write(|_| Ok(()))).unwrap_err().kind,
+        DbErrorKind::Closed
+    );
+    assert_eq!(block_on(w.close()).unwrap_err().kind, DbErrorKind::Closed);
+    assert_ne!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        std::thread::current().id()
+    );
+    assert!(block_on(w.write(|_| Ok(()))).is_err());
+}
+
+#[test]
+fn committed_refresh_failure_preserves_revision_and_undo_including_reset() {
+    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    struct RefreshFault(Arc<std::sync::atomic::AtomicU8>);
+    impl TransactionParticipant for RefreshFault {
+        fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn before_commit(
+            &self,
+            _: &mut dyn SqliteConnection,
+            _: WriteOrigin,
+        ) -> Result<(), DbError> {
+            self.0.store(3, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
+            true
+        }
+    }
+    let flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let (tx, _rx) = mpsc::channel();
+    let w = block_on(DatabaseWorker::open(move || {
+        let db = ModelContainer::open(
+            FaultDriver {
+                fail: flag.clone(),
+                dropped: tx,
+            },
+            schema![Note],
+        )?;
+        db.install_transaction_participant(RefreshFault(flag))?;
+        Ok(db)
+    }))
+    .unwrap();
+    block_on(w.enable_undo(10)).unwrap();
+    let mut observed = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    assert_eq!(block_on(observed.next()).unwrap().unwrap().revision, 0);
+    let err = block_on(w.write(|db| {
+        db.insert(note(1));
+        Ok(())
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind, DbErrorKind::CommittedRefreshFailed);
+    assert_eq!(count(&w), 1);
+    let snapshot = block_on(observed.next()).unwrap().unwrap();
+    assert_eq!((snapshot.revision, snapshot.value), (1, 1));
+    assert_eq!(block_on(w.undo_status()).unwrap(), (true, false));
+    assert_eq!(
+        block_on(w.undo(false)).unwrap_err().kind,
+        DbErrorKind::CommittedRefreshFailed
+    );
+    assert_eq!(count(&w), 0);
+    assert_eq!(block_on(w.undo_status()).unwrap(), (false, true));
+    assert_eq!(
+        block_on(w.undo(true)).unwrap_err().kind,
+        DbErrorKind::CommittedRefreshFailed
+    );
+    assert_eq!(count(&w), 1);
+    assert_eq!(
+        block_on(w.write_resetting_undo(|db| db.delete::<Note>(1u64)))
+            .unwrap_err()
+            .kind,
+        DbErrorKind::CommittedRefreshFailed
+    );
+    assert_eq!(count(&w), 0);
+    assert_eq!(block_on(w.undo_status()).unwrap(), (false, false));
+    block_on(w.close()).unwrap();
+}
+
+#[test]
+fn participant_refreshes_direct_save_autosave_and_nonlocal_worker_origins() {
+    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    struct Project;
+    impl TransactionParticipant for Project {
+        fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn before_commit(
+            &self,
+            c: &mut dyn SqliteConnection,
+            origin: WriteOrigin,
+        ) -> Result<(), DbError> {
+            c.execute("UPDATE notes SET read=1", &[])?;
+            c.execute(
+                "INSERT INTO origins VALUES(?)",
+                &[day_persistence::Value::Text(format!("{origin:?}"))],
+            )?;
+            Ok(())
+        }
+        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
+            true
+        }
+    }
+    fn factory() -> Result<ModelContainer, DbError> {
+        let db = ModelContainer::open(Sqlite::memory(), schema![Note])?;
+        db.try_with_connection(|c| c.execute_batch("CREATE TABLE origins(value TEXT)"))?;
+        db.install_transaction_participant(Project)?;
+        Ok(db)
+    }
+    let scope = day_reactive::Scope::detached();
+    scope.enter(|| {
+        let db = factory().unwrap();
+        db.set_autosave(false);
+        db.insert(note(1));
+        db.save().unwrap();
+        assert!(db.get::<Note>(1u64).unwrap().read().read());
+        db.set_autosave(true);
+        day_reactive::batch(|| {
+            db.insert(note(2));
+        });
+        let rows = db.query::<Note>().live().try_collect().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.read));
+    });
+    scope.dispose();
+    let w = block_on(DatabaseWorker::open(factory)).unwrap();
+    for origin in [WriteOrigin::RemoteImport, WriteOrigin::Maintenance] {
+        block_on(w.write_with_origin(origin, |db| {
+            db.insert(note(1));
+            Ok(())
+        }))
+        .unwrap();
+        block_on(w.read(|db| {
+            assert!(db.query::<Note>().live().try_collect().unwrap()[0].read);
+            Ok(())
+        }))
+        .unwrap();
+        block_on(w.write_with_origin(WriteOrigin::Maintenance, |db| db.delete::<Note>(1u64)))
+            .unwrap();
+    }
+    block_on(w.close()).unwrap();
+}
+
+#[test]
+fn direct_save_refresh_failure_does_not_rejournal_the_already_committed_edit() {
+    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    struct CountCommits(Arc<std::sync::atomic::AtomicU8>);
+    impl TransactionParticipant for CountCommits {
+        fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn before_commit(
+            &self,
+            c: &mut dyn SqliteConnection,
+            _: WriteOrigin,
+        ) -> Result<(), DbError> {
+            c.execute("INSERT INTO committed_once VALUES(1)", &[])?;
+            self.0.store(3, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
+            true
+        }
+    }
+    day_reactive::Scope::detached().enter(|| {
+        let flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let (tx, _rx) = mpsc::channel();
+        let db = ModelContainer::open(
+            FaultDriver {
+                fail: flag.clone(),
+                dropped: tx,
+            },
+            schema![Note],
+        )
+        .unwrap();
+        db.set_autosave(false);
+        db.try_with_connection(|c| c.execute_batch("CREATE TABLE committed_once(value INTEGER)"))
+            .unwrap();
+        db.install_transaction_participant(CountCommits(flag))
+            .unwrap();
+        db.insert(note(1));
+        assert_eq!(
+            db.save().unwrap_err().kind,
+            DbErrorKind::CommittedRefreshFailed
+        );
+        // Only repair cache state: there must be no second participant journal entry.
+        db.rescan().unwrap();
+        db.save().unwrap();
+        db.try_with_connection(|c| {
+            c.query("SELECT count(*) FROM committed_once", &[], &mut |r| {
+                assert_eq!(r.get(0), day_persistence::Value::Int(1))
+            })
+        })
+        .unwrap();
+        assert_eq!(db.table_count::<Note>().unwrap(), 1);
+    });
 }

@@ -18,8 +18,9 @@ license.workspace = true
 default = ["driver-rusqlite", "bundled", "pieces"]
 # Native: rusqlite over the chosen engine. Web: day-sqlite-worker, the same vendored SQLite
 # running against OPFS in the day-sql worker, reached synchronously over the SharedArrayBuffer
-# channel (docs/persistence.md, docs/web.md).
-driver-rusqlite = ["dep:rusqlite", "dep:day-sqlite-worker"]
+# channel (docs/persistence.md, docs/web.md). day-spec resolves `Sqlite::app_data`'s directory
+# (`storage::data_dir()`), the one every Day crate keeps an app's files in.
+driver-rusqlite = ["dep:rusqlite", "dep:day-sqlite-worker", "dep:day-spec"]
 bundled = ["rusqlite?/bundled"]
 system = []
 cipher = ["rusqlite?/bundled-sqlcipher-vendored-openssl"]

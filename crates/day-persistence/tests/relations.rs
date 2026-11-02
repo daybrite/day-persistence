@@ -127,7 +127,7 @@ struct LineItem {
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-rel-{}-{}.sqlite",
+        "day-persistence-rel-{}-{}.db",
         std::process::id(),
         name
     ));

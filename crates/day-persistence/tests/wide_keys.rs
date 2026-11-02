@@ -38,7 +38,7 @@ struct Counter {
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-widekeys-{}-{}.sqlite",
+        "day-persistence-widekeys-{}-{}.db",
         std::process::id(),
         name
     ));

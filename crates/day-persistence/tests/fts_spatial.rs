@@ -513,7 +513,7 @@ fn wide_fts_backfills_reopens_and_survives_vacuum_and_tokenizer_migration() {
         id: String,
         body: String,
     }
-    let path = std::env::temp_dir().join(format!("day-wide-fts-{}.sqlite", std::process::id()));
+    let path = std::env::temp_dir().join(format!("day-wide-fts-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {
         let db = ModelContainer::open(Sqlite::at(&path), schema![Before]).unwrap();

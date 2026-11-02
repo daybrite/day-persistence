@@ -52,11 +52,12 @@ impl Sqlite {
         Sqlite::from_opts(OpenOptions::new(Location::Memory))
     }
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-    /// The database named `name` in the per-app data directory, created if missing. The
-    /// directory follows the day-part-filesystem root rules (docs/fs.md): `DAY_DATA_DIR` when the
-    /// host passes one (the Android and OpenHarmony hosts do), the platform's app-data
-    /// convention otherwise, and a `day-db/` leaf of its own beside day-part-filesystem' `day-fs/`.
-    /// `name` is a file name, not a path. Errs where no such directory exists (web has no
+    /// The database named `name` (`"notes.db"`: `.db` by convention) in the app's data
+    /// directory, `day_spec::storage::data_dir()`, created if missing: a folder named for the app
+    /// in the platform's place for app data (Application Support, `%LOCALAPPDATA%`,
+    /// `$XDG_DATA_HOME`, the Android and HarmonyOS files directory; Day's docs/fs.md "Where files
+    /// live"), or `DAY_DATA_DIR` when a host or a test sets it. `name` is a file name, not a path.
+    /// Errs where no such directory exists (web has no
     /// filesystem; keep a wasm build on [`Sqlite::memory`] or its own driver).
     pub fn app_data(name: impl AsRef<str>) -> Result<Self, DbError> {
         let name = name.as_ref();
@@ -306,49 +307,16 @@ impl SqliteDriver for Sqlite {
     }
 }
 
-/// The `day-db/` sibling of day-part-filesystem' root: same resolution order, its own leaf, so the
-/// database never collides with other day state in the directory.
+/// The app's data directory (`day_spec::storage::data_dir()`), shared with day-part-filesystem
+/// (whose files keep to its `day-fs/` leaf) and everything else of the app's.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn app_data_root() -> Result<std::path::PathBuf, DbError> {
-    use std::path::PathBuf;
-    let no_dir = || {
+    day_spec::storage::data_dir().ok_or_else(|| {
         DbError::new(
             DbErrorKind::Unsupported,
             "no per-app data directory on this target",
         )
-    };
-    if let Some(dir) = std::env::var_os("DAY_DATA_DIR")
-        && !dir.is_empty()
-    {
-        return Ok(PathBuf::from(dir).join("day-db"));
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        std::env::var_os("HOME")
-            .map(|home| {
-                PathBuf::from(home)
-                    .join("Library/Application Support/day")
-                    .join("day-db")
-            })
-            .ok_or_else(no_dir)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("APPDATA")
-            .map(|app| PathBuf::from(app).join("day").join("day-db"))
-            .ok_or_else(no_dir)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
-    {
-        if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
-            && !dir.is_empty()
-        {
-            return Ok(PathBuf::from(dir).join("day").join("day-db"));
-        }
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".local/share/day").join("day-db"))
-            .ok_or_else(no_dir)
-    }
+    })
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

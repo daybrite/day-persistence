@@ -198,6 +198,14 @@ impl<R> Drop for WorkerRequest<R> {
         }
     }
 }
+// A refresh error is a durable commit, including for undo/redo and reset operations.
+fn committed<T>(result: &Result<T, DbError>) -> bool {
+    result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind == DbErrorKind::CommittedRefreshFailed)
+}
 fn closed() -> DbError {
     DbError::new(DbErrorKind::Closed, "database worker is closed")
 }
@@ -329,12 +337,22 @@ impl DatabaseWorker {
         &self,
         write: impl FnOnce(&ModelContainer) -> Result<R, DbError> + Send + 'static,
     ) -> WorkerRequest<R> {
+        self.write_with_origin(crate::WriteOrigin::Local, write)
+    }
+
+    /// A transactional import or maintenance operation. Remote imports persist normally;
+    /// participants use the origin to suppress outbound echo, not the database writes.
+    pub fn write_with_origin<R: Send + 'static>(
+        &self,
+        origin: crate::WriteOrigin,
+        write: impl FnOnce(&ModelContainer) -> Result<R, DbError> + Send + 'static,
+    ) -> WorkerRequest<R> {
         self.submit(false, move |session| {
             let checkpoint = session.undo.as_ref().map(|undo| undo.checkpoint());
             let group = session.undo.as_ref().map(|undo| undo.begin_group("edit"));
-            let result = session.db.worker_write(write);
+            let result = session.db.worker_write_origin(origin, write);
             drop(group); // Seal even when no UI observer caused a reactive turn-end drain.
-            if result.is_ok() {
+            if committed(&result) {
                 session.revision += 1;
                 session.needs_publish = true;
             } else if let (Some(undo), Some(checkpoint)) = (&session.undo, checkpoint) {
@@ -356,7 +374,7 @@ impl DatabaseWorker {
             let result = session
                 .db
                 .worker_write(|db| day_model::with_author("reset", || write(db)));
-            if result.is_ok() {
+            if committed(&result) {
                 if let Some(undo) = &session.undo {
                     undo.clear();
                 }
@@ -402,7 +420,7 @@ impl DatabaseWorker {
             let result = session
                 .db
                 .worker_write(|_| Ok(if redo { undo.redo() } else { undo.undo() }));
-            if result.is_ok() {
+            if committed(&result) {
                 session.revision += 1;
                 session.needs_publish = true;
             } else {

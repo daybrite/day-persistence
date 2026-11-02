@@ -28,7 +28,7 @@ fn title_of(container: &ModelContainer, id: u32) -> String {
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "day-persistence-cipher-{}-{}.sqlite",
+        "day-persistence-cipher-{}-{}.db",
         std::process::id(),
         name
     ));

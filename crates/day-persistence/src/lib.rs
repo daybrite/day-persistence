@@ -125,6 +125,9 @@ pub enum DbErrorKind {
     Cancelled,
     /// A worker operation panicked. The worker is closed and must be reopened.
     Panicked,
+    /// The transaction committed, but refreshing resident models failed. Do not replay the
+    /// write. Recover the cache with `rescan` before editing; workers retry before their next job.
+    CommittedRefreshFailed,
     /// The engine said no: SQL error, I/O, constraint.
     Driver,
     /// The stored schema and the declared one disagree in a way lightweight migration cannot
@@ -1136,6 +1139,41 @@ pub(crate) struct TableHooks {
     pub(crate) watch_undo: Rc<dyn Fn(&day_model::UndoStack)>,
 }
 
+/// Why a durable transaction is being performed. Cache refreshes use EXTERNAL_AUTHOR and
+/// do not constitute a write transaction. Remote imports persist but must not echo outbound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WriteOrigin {
+    #[default]
+    Local,
+    RemoteImport,
+    Maintenance,
+}
+
+/// Queue-confined extension participating in the SAME SQL transaction as model changes.
+/// Callbacks must use only the supplied connection, never re-enter the container, commit,
+/// roll back, perform network I/O, or mutate reactive models. Returning an error aborts the
+/// transaction. `before_commit` runs after worker reactions and intermediate saves settle.
+/// Persist extension state transactionally; callbacks may run again following a rollback.
+pub trait TransactionParticipant: 'static {
+    /// SQL projections made by a participant may change model rows after their caches were
+    /// flushed. Refresh resident models after a successful COMMIT, before acknowledging work.
+    /// A refresh failure is reported after commit (it cannot roll back durable data).
+    fn refresh_after_commit(&self, _origin: WriteOrigin) -> bool {
+        false
+    }
+
+    fn begin(
+        &self,
+        connection: &mut dyn SqliteConnection,
+        origin: WriteOrigin,
+    ) -> Result<(), DbError>;
+    fn before_commit(
+        &self,
+        connection: &mut dyn SqliteConnection,
+        origin: WriteOrigin,
+    ) -> Result<(), DbError>;
+}
+
 pub(crate) struct ContainerInner {
     conn: RefCell<Box<dyn SqliteConnection>>,
     caps: Capabilities,
@@ -1165,6 +1203,8 @@ pub(crate) struct ContainerInner {
     autosave: Cell<bool>,
     /// An outer worker transaction owns commit/rollback; inner model saves only execute SQL.
     worker_transaction: Cell<bool>,
+    participant: RefCell<Option<Rc<dyn TransactionParticipant>>>,
+    refresh_pending: Cell<bool>,
     /// Soft per-table bound on resident rows. Dirty and observed rows never evict, so the
     /// working set can exceed it; everything else does not.
     cache_limit: Cell<usize>,
@@ -1226,6 +1266,8 @@ impl ModelContainer {
                 sink: Cell::new(None),
                 autosave: Cell::new(true),
                 worker_transaction: Cell::new(false),
+                refresh_pending: Cell::new(false),
+                participant: RefCell::new(None),
                 cache_limit: Cell::new(DEFAULT_CACHE_LIMIT),
                 eviction_retry: RefCell::new(HashMap::new()),
                 error,
@@ -1304,6 +1346,48 @@ impl ModelContainer {
         }
     }
 
+    /// Install one transaction extension before exposing the container to writers. Registration
+    /// does not initialize its schema; do that in the worker factory first. No replacement or
+    /// removal is supported, preventing a sync-enabled connection silently losing journaling.
+    pub fn install_transaction_participant(
+        &self,
+        participant: impl TransactionParticipant,
+    ) -> Result<(), DbError> {
+        if self.inner.worker_transaction.get()
+            || !self.inner.dirty.borrow().is_empty()
+            || self.inner.participant.borrow().is_some()
+        {
+            return Err(DbError::new(
+                DbErrorKind::Deny,
+                "transaction participant must be installed on an idle, clean container",
+            ));
+        }
+        *self.inner.participant.borrow_mut() = Some(Rc::new(participant));
+        Ok(())
+    }
+
+    fn participant_begin(
+        &self,
+        conn: &mut dyn SqliteConnection,
+        origin: WriteOrigin,
+    ) -> Result<(), DbError> {
+        if let Some(p) = self.inner.participant.borrow().as_ref() {
+            p.begin(conn, origin)?;
+        }
+        Ok(())
+    }
+
+    fn participant_commit(
+        &self,
+        conn: &mut dyn SqliteConnection,
+        origin: WriteOrigin,
+    ) -> Result<(), DbError> {
+        if let Some(p) = self.inner.participant.borrow().as_ref() {
+            p.before_commit(conn, origin)?;
+        }
+        Ok(())
+    }
+
     /// The last autosave failure, if any, as a tracked signal the UI can watch.
     pub fn last_error(&self) -> day_reactive::Signal<Option<String>> {
         self.inner.error
@@ -1330,6 +1414,9 @@ impl ModelContainer {
         if self.inner.flushing.get() {
             return Ok(Vec::new());
         }
+        if self.inner.refresh_pending.get() {
+            self.refresh_committed()?;
+        }
         let dirty = {
             let mut d = self.inner.dirty.borrow_mut();
             if d.is_empty() {
@@ -1342,6 +1429,7 @@ impl ModelContainer {
             std::mem::take(&mut *d)
         };
         self.inner.flushing.set(true);
+        let had_writes = !dirty.is_empty();
         let result = self.flush(&dirty);
         self.inner.flushing.set(false);
         match &result {
@@ -1363,7 +1451,46 @@ impl ModelContainer {
                 self.inner.error.set(Some(e.to_string()));
             }
         }
+        if result.is_ok() && !self.inner.worker_transaction.get() && had_writes {
+            self.participant_refresh(WriteOrigin::Local)?;
+        }
         result
+    }
+
+    fn participant_refresh(&self, origin: WriteOrigin) -> Result<(), DbError> {
+        let refresh = self
+            .inner
+            .participant
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.refresh_after_commit(origin));
+        if refresh {
+            self.inner.refresh_pending.set(true);
+            self.refresh_committed().map_err(|e| {
+                let error = DbError::new(DbErrorKind::CommittedRefreshFailed, e.to_string());
+                self.inner.error.set(Some(error.to_string()));
+                error
+            })?;
+        }
+        Ok(())
+    }
+
+    fn refresh_committed(&self) -> Result<(), DbError> {
+        if !self.inner.dirty.borrow().is_empty() {
+            return Err(DbError::new(
+                DbErrorKind::Deny,
+                "refresh committed state before making further model edits",
+            ));
+        }
+        self.refresh_resident()?;
+        self.invalidate_relation_memos();
+        self.requery_all();
+        if self.inner.caps.external_changes {
+            self.inner.data_version.set(self.file_data_version()?);
+        }
+        self.inner.refresh_pending.set(false);
+        self.inner.error.set_if_changed(None);
+        Ok(())
     }
 
     // --- faulting ----------------------------------------------------------------------------
@@ -2353,6 +2480,10 @@ impl ModelContainer {
         let outer = self.inner.worker_transaction.get();
         if !outer {
             conn.begin()?;
+            if let Err(error) = self.participant_begin(conn.as_mut(), WriteOrigin::Local) {
+                let _ = conn.rollback();
+                return Err(error);
+            }
         }
         for (sql, params) in &stmts {
             if let Err(e) = conn.execute(sql, params) {
@@ -2362,7 +2493,11 @@ impl ModelContainer {
                 return Err(e);
             }
         }
-        if !outer && let Err(error) = conn.commit() {
+        if !outer
+            && let Err(error) = self
+                .participant_commit(conn.as_mut(), WriteOrigin::Local)
+                .and_then(|_| conn.commit())
+        {
             let _ = conn.rollback();
             return Err(error);
         }
@@ -2374,6 +2509,9 @@ impl ModelContainer {
         for hooks in self.inner.tables.borrow().values() {
             (hooks.dispose_cache)();
         }
+        // Reactive callbacks can retain a container until thread teardown. Release transaction
+        // resources (including replication's writer lease) before acknowledging worker close.
+        self.inner.participant.borrow_mut().take();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2381,8 +2519,27 @@ impl ModelContainer {
         &self,
         write: impl FnOnce(&Self) -> Result<R, DbError>,
     ) -> Result<R, DbError> {
+        self.worker_write_origin(WriteOrigin::Local, write)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn worker_write_origin<R>(
+        &self,
+        origin: WriteOrigin,
+        write: impl FnOnce(&Self) -> Result<R, DbError>,
+    ) -> Result<R, DbError> {
         self.save()?;
         self.conn().begin()?;
+        let admission = self.participant_begin(self.conn().as_mut(), origin);
+        if let Err(error) = admission {
+            self.conn().rollback().map_err(|rollback| {
+                DbError::new(
+                    DbErrorKind::Closed,
+                    format!("transaction admission rollback failed: {rollback}"),
+                )
+            })?;
+            return Err(error);
+        }
         self.inner.worker_transaction.set(true);
         let result = day_reactive::batch(|| {
             let value = write(self)?;
@@ -2393,6 +2550,7 @@ impl ModelContainer {
             // Reactions may have made additional writes while the batch drained. Commit only
             // after those writes settle, never before turn-end autosave has run.
             self.save()?;
+            self.participant_commit(self.conn().as_mut(), origin)?;
             self.conn().commit()?;
             Ok(value)
         });
@@ -2405,6 +2563,9 @@ impl ModelContainer {
                 )
             })?;
             self.worker_discard_changes()?;
+        }
+        if result.is_ok() {
+            self.participant_refresh(origin)?;
         }
         result
     }

@@ -47,7 +47,7 @@ impl Scene {
         Ok(Self {
             db: Rc::new(RefCell::new(Database::open(Sqlite::memory(), trace)?)),
             status: Signal::new(res::str::memory_open().format()),
-            name: Signal::new("lab.sqlite".into()),
+            name: Signal::new("lab.db".into()),
             id: Signal::new("1".into()),
             title: Signal::new(String::new()),
             done: Signal::new(false),

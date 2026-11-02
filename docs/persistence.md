@@ -317,10 +317,11 @@ is one the batch never detached, an orphan the cascade rule is supposed to take.
 The container speaks to SQLite through the `SqliteDriver` trait; two drivers are built in.
 
 **`Sqlite`** (feature `driver-rusqlite`, on by default) is rusqlite. `Sqlite::at(path)` opens a
-file, `Sqlite::memory()` an in-memory database, and `Sqlite::app_data("name.db")` the per-app
-data directory: `DAY_DATA_DIR` when the host passes one (the Android and OpenHarmony hosts do),
-the platform's app-data convention otherwise, under a `day-db/` leaf beside
-[day-part-filesystem](https://daybrite.dev/docs/internal/fs/)'s `day-fs/`. Builder options: `.key(Secret)` for SQLCipher,
+file, `Sqlite::memory()` an in-memory database, and `Sqlite::app_data("name.db")` a file in the
+app's data directory, `day::storage::data_dir()`: a folder named after the app id where its
+platform keeps app data (`~/Library/Application Support/<id>`, `%LOCALAPPDATA%\<id>`,
+`$XDG_DATA_HOME/<id>`, the Android and HarmonyOS files directory), or `DAY_DATA_DIR` when a host
+or a test sets it ([where app data lives](https://daybrite.dev/docs/how-to/guide-storage/#where-app-data-lives)). Name databases `.db`. Builder options: `.key(Secret)` for SQLCipher,
 `.cipher_migrate()` to accept an older cipher generation, `.wal(false)` to opt out of WAL, and
 `.with_init(|conn| …)`, a hook over the raw rusqlite connection for loadable extensions,
 custom SQL functions, and PRAGMAs the crate does not model.
@@ -976,3 +977,33 @@ transaction and clears undo/redo only after success, on the same queue. Use it f
 local-data reset or authoritative reimport: old undo commands must not resurrect discarded
 records or replay them into the new dataset. A failed replacement rolls back its writes and
 preserves the previous history. Observers receive the committed replacement normally.
+
+## Transaction participants and synchronization
+
+`ModelContainer::install_transaction_participant` installs one queue-confined extension on a
+clean, idle container. Its `begin` and `before_commit` callbacks receive the active SQL connection
+and a `WriteOrigin` (`Local`, `RemoteImport`, or `Maintenance`). Callback SQL shares the model
+transaction. A callback error rolls back the transaction. A `DatabaseWorker::write_with_origin`
+job invokes the participant once around the whole job, including intermediate saves and reactive
+follow-on edits. `write` uses `Local`; direct container saves also use `Local`.
+
+Callbacks must persist their state in that SQL transaction and must not reenter the container,
+mutate reactive models, commit, roll back, or perform network I/O. A failed callback may be retried;
+process-local counters are not durable journal state. Installing another participant, installing
+while dirty, or installing during a worker transaction is rejected. Ordinary raw connection SQL
+is not implicitly instrumented; extensions that require complete capture must guard their tables.
+
+There is deliberately one participant per container. A caller needing several extensions must
+install one composite participant with explicit callback ordering and shared rollback semantics.
+The origin is a trusted caller declaration, not an authorization boundary.
+
+A participant can request `refresh_after_commit` when its SQL changes resident model rows.
+This applies to direct saves/autosave and worker transactions. A failed refresh returns
+`DbErrorKind::CommittedRefreshFailed`: the data is durable, so do not retry the edit. Worker
+revision and undo/redo bookkeeping still advance (a committed replacement clears undo).
+Workers retry the cache refresh before subsequent database operations. Direct-container callers
+must `rescan()` successfully before making further edits; `last_error` also exposes autosave
+failures. Refreshing cannot roll back a committed transaction.
+
+Synchronization protocols and application-specific experiments are outside this crate's contract.
+Updating persistence does not enroll an application in synchronization.

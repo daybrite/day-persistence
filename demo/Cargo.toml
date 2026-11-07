@@ -24,14 +24,14 @@ mock = ["day/mock"]
 name = "dayapp"
 
 [dependencies]
-day = { package = "day-app", version = "0.6", features = ["model"] }
-day-persistence = { path = "../crates/day-persistence" }
+day = { package = "day-app", version = "0.*", features = ["model"] }
+day-persistence = { version = "0.*", path = "../crates/day-persistence" }
 # JSON is the portable typed-record exchange format.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-day-build = "0.6"
+day-build = "0.*"
 
 
 [workspace]

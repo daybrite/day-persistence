@@ -15,7 +15,7 @@
 
 use std::cmp::Ordering;
 
-use crate::Value;
+use crate::{Value, ident};
 
 /// A row, as a predicate can read it: column name → stored value. Implementations answer in
 /// the column's stored language (through the field's codec), which is the language predicates
@@ -380,17 +380,29 @@ pub(crate) enum RelSql {
 pub(crate) trait SqlIndex {
     /// Resolve `owner.field` to its wired SQL shape; `None` fails the compile, loudly.
     fn relation(&self, owner: &str, field: &str) -> Option<RelSql>;
-    /// The key column of `table`.
+    /// The key column of `table`, as a plain name.
     fn key_of(&self, table: &str) -> Option<String>;
+    /// `table` as a statement names it: quoted, schema-qualified when attached.
+    fn table_sql(&self, table: &str) -> String;
     /// The FTS5 shadow table of `table`, when the model declares `fts(…)`.
-    fn fts_of(&self, table: &str) -> Option<String>;
+    fn fts_of(&self, table: &str) -> Option<FtsSql>;
     fn fts_key_of(&self, _table: &str) -> &str {
         "rowid"
     }
-    /// The R*Tree shadow of `table`, when `lat`/`lon` are its declared `spatial(…)` pair.
+    /// The R*Tree shadow of `table`, quoted, when `lat`/`lon` are its declared `spatial(…)`
+    /// pair.
     fn geo_of(&self, table: &str, lat: &str, lon: &str) -> Option<String>;
     /// Whether the connection has `day_fold` registered (exact Unicode case folding in SQL).
     fn unicode_fold(&self) -> bool;
+}
+
+/// An FTS5 shadow as SQL names it: the table in a `FROM` (`"catalog"."stations_fts"`), and
+/// the hidden column `MATCH` takes, which carries the index's own name and no schema
+/// (`"catalog"."stations_fts" MATCH` is a syntax error, `"stations_fts" MATCH` is not).
+#[derive(Clone, Debug)]
+pub(crate) struct FtsSql {
+    pub from: String,
+    pub match_col: String,
 }
 
 /// Why a fetch would not compile. `NeedsFold` routes to the fallback evaluator; everything
@@ -438,7 +450,8 @@ pub(crate) fn compile_fetch(
     fetch: &Fetch,
     idx: &dyn SqlIndex,
 ) -> Result<SqlQuery, CompileErr> {
-    let key = idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?;
+    let key = ident(&idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?);
+    let t = idx.table_sql(table);
     let mut params = Vec::new();
     let mut aliases = 0usize;
     let by_rank = fetch.sort.iter().any(|s| s.by_rank);
@@ -449,19 +462,18 @@ pub(crate) fn compile_fetch(
     let (from, rank_pred);
     if by_rank {
         let fts = idx.fts_of(table).ok_or(CompileErr::NoFts)?;
-        // The hidden `MATCH` column carries the index's bare name, schema-qualified or not.
-        let fts_bare = fts.rsplit('.').next().unwrap_or(&fts).to_string();
         let Some(q) = find_match_query(&fetch.pred) else {
             return Err(CompileErr::NoFts);
         };
         params.push(Value::Text(q));
         let fts_key = idx.fts_key_of(table);
         from = format!(
-            "{table} JOIN {fts} AS day_rank ON day_rank.{fts_key} = {table}.{key} AND day_rank.{fts_bare} MATCH ?"
+            "{t} JOIN {} AS day_rank ON day_rank.{fts_key} = {t}.{key} AND day_rank.{} MATCH ?",
+            fts.from, fts.match_col
         );
         rank_pred = true;
     } else {
-        from = table.to_string();
+        from = t.clone();
         rank_pred = false;
     }
 
@@ -472,14 +484,14 @@ pub(crate) fn compile_fetch(
     let where_clause = pred_sql(
         &fetch.pred,
         table,
-        table,
+        &t,
         &key,
         &ctx,
         &mut params,
         &mut aliases,
     )?;
 
-    let mut sql = format!("SELECT {table}.{key} FROM {from}");
+    let mut sql = format!("SELECT {t}.{key} FROM {from}");
     if where_clause != "1" {
         sql.push_str(&format!(" WHERE {where_clause}"));
     }
@@ -489,15 +501,15 @@ pub(crate) fn compile_fetch(
             orders.push("day_rank.rank".into());
         } else {
             orders.push(format!(
-                "{table}.{} {}",
-                s.column,
+                "{t}.{} {}",
+                ident(s.column),
                 if s.ascending { "ASC" } else { "DESC" }
             ));
         }
     }
     // The key tie-break makes the order total and deterministic, so the same fetch always
     // answers in the same order and a diff against the previous answer is meaningful.
-    orders.push(format!("{table}.{key} ASC"));
+    orders.push(format!("{t}.{key} ASC"));
     sql.push_str(&format!(" ORDER BY {}", orders.join(", ")));
     if let Some(n) = fetch.limit {
         sql.push_str(&format!(" LIMIT {n}"));
@@ -513,7 +525,8 @@ pub(crate) fn compile_count(
     fetch: &Fetch,
     idx: &dyn SqlIndex,
 ) -> Result<SqlQuery, CompileErr> {
-    let key = idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?;
+    let key = ident(&idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?);
+    let t = idx.table_sql(table);
     let mut params = Vec::new();
     let mut aliases = 0usize;
     let ctx = SqlCtx {
@@ -523,13 +536,13 @@ pub(crate) fn compile_count(
     let where_clause = pred_sql(
         &fetch.pred,
         table,
-        table,
+        &t,
         &key,
         &ctx,
         &mut params,
         &mut aliases,
     )?;
-    let mut sql = format!("SELECT COUNT(*) FROM {table}");
+    let mut sql = format!("SELECT COUNT(*) FROM {t}");
     if where_clause != "1" {
         sql.push_str(&format!(" WHERE {where_clause}"));
     }
@@ -550,7 +563,8 @@ pub(crate) fn compile_fallback(
         // exact; refuse rather than under- or over-answer.
         return Err(CompileErr::FoldInsideRelation);
     }
-    let key = idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?;
+    let key = ident(&idx.key_of(table).ok_or(CompileErr::Unwired("", ""))?);
+    let t = idx.table_sql(table);
     let mut params = Vec::new();
     let mut aliases = 0usize;
     let ctx = SqlCtx {
@@ -568,7 +582,7 @@ pub(crate) fn compile_fallback(
             clauses.push(pred_sql(
                 c,
                 table,
-                table,
+                &t,
                 &key,
                 &ctx,
                 &mut params,
@@ -585,17 +599,17 @@ pub(crate) fn compile_fallback(
         }
     }
     let cols = if deps.is_empty() {
-        format!("{table}.{key}")
+        format!("{t}.{key}")
     } else {
         format!(
-            "{table}.{key}, {}",
+            "{t}.{key}, {}",
             deps.iter()
-                .map(|c| format!("{table}.{c}"))
+                .map(|c| format!("{t}.{}", ident(c)))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     };
-    let mut sql = format!("SELECT {cols} FROM {table}");
+    let mut sql = format!("SELECT {cols} FROM {t}");
     let clauses: Vec<String> = clauses.into_iter().filter(|c| c != "1").collect();
     if !clauses.is_empty() {
         sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
@@ -606,13 +620,13 @@ pub(crate) fn compile_fallback(
         .filter(|s| !s.by_rank)
         .map(|s| {
             format!(
-                "{table}.{} {}",
-                s.column,
+                "{t}.{} {}",
+                ident(s.column),
                 if s.ascending { "ASC" } else { "DESC" }
             )
         })
         .collect();
-    orders.push(format!("{table}.{key} ASC"));
+    orders.push(format!("{t}.{key} ASC"));
     sql.push_str(&format!(" ORDER BY {}", orders.join(", ")));
     Ok((SqlQuery { sql, params }, deps))
 }
@@ -635,10 +649,10 @@ struct SqlCtx<'a> {
     skip_matches: bool,
 }
 
-/// The `WHERE` form of one predicate, columns qualified by `alias` (the current table or an
-/// `EXISTS` alias), appending bound parameters to `params`. `table` is the alias's underlying
-/// table name, which FTS and R*Tree shadow lookups resolve against, since an `EXISTS` alias
-/// like `day_r0` names no shadow.
+/// The `WHERE` form of one predicate, columns qualified by `alias` (the current table, quoted,
+/// or an `EXISTS` alias), appending bound parameters to `params`. `table` is the alias's
+/// underlying table's plain name, which FTS and R*Tree shadow lookups resolve against, since
+/// an `EXISTS` alias like `day_r0` names no shadow. `key` is its key column, already quoted.
 fn pred_sql(
     pred: &Pred,
     table: &str,
@@ -648,44 +662,46 @@ fn pred_sql(
     params: &mut Vec<Value>,
     aliases: &mut usize,
 ) -> Result<String, CompileErr> {
+    // A column through the alias, quoted: `"t"."order"`, `day_r0."group"`.
+    let col = |c: &str| format!("{alias}.{}", ident(c));
     Ok(match pred {
         Pred::Always => "1".into(),
-        Pred::Eq(c, Value::Null) => format!("{alias}.{c} IS NULL"),
-        Pred::Ne(c, Value::Null) => format!("{alias}.{c} IS NOT NULL"),
+        Pred::Eq(c, Value::Null) => format!("{} IS NULL", col(c)),
+        Pred::Ne(c, Value::Null) => format!("{} IS NOT NULL", col(c)),
         Pred::Eq(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} = ?")
+            format!("{} = ?", col(c))
         }
         Pred::Ne(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} <> ?")
+            format!("{} <> ?", col(c))
         }
         Pred::Lt(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} < ?")
+            format!("{} < ?", col(c))
         }
         Pred::Le(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} <= ?")
+            format!("{} <= ?", col(c))
         }
         Pred::Gt(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} > ?")
+            format!("{} > ?", col(c))
         }
         Pred::Ge(c, v) => {
             params.push(v.clone());
-            format!("{alias}.{c} >= ?")
+            format!("{} >= ?", col(c))
         }
         Pred::Contains(c, s) => {
             params.push(Value::Text(s.clone()));
-            format!("instr({alias}.{c}, ?) > 0")
+            format!("instr({}, ?) > 0", col(c))
         }
         Pred::ContainsCi(c, s) => {
             if !ctx.idx.unicode_fold() {
                 return Err(CompileErr::NeedsFold);
             }
             params.push(Value::Text(s.to_lowercase()));
-            format!("instr(day_fold({alias}.{c}), ?) > 0")
+            format!("instr(day_fold({}), ?) > 0", col(c))
         }
         Pred::StartsWith(c, prefix) => {
             // Not `LIKE`: SQLite's `LIKE` is case-insensitive for ASCII by default, which
@@ -693,7 +709,7 @@ fn pred_sql(
             // `TEXT`, which agrees with Rust's `starts_with` on any valid UTF-8.
             params.push(Value::Int(prefix.chars().count() as i64));
             params.push(Value::Text(prefix.clone()));
-            format!("substr({alias}.{c}, 1, ?) = ?")
+            format!("substr({}, 1, ?) = ?", col(c))
         }
         Pred::StartsWithCi(c, prefix) => {
             if !ctx.idx.unicode_fold() {
@@ -702,7 +718,7 @@ fn pred_sql(
             let folded = prefix.to_lowercase();
             params.push(Value::Int(folded.chars().count() as i64));
             params.push(Value::Text(folded));
-            format!("substr(day_fold({alias}.{c}), 1, ?) = ?")
+            format!("substr(day_fold({}), 1, ?) = ?", col(c))
         }
         Pred::In(c, set) | Pred::NotIn(c, set) => {
             // The empty set compiles to its three-valued constant: `IN ()` matches nothing;
@@ -714,7 +730,7 @@ fn pred_sql(
                 return Ok(if matches!(pred, Pred::In(..)) {
                     "0".into()
                 } else {
-                    format!("{alias}.{c} IS NOT NULL")
+                    format!("{} IS NOT NULL", col(c))
                 });
             }
             let negate = if matches!(pred, Pred::NotIn(..)) {
@@ -724,7 +740,7 @@ fn pred_sql(
             };
             let marks = vec!["?"; set.len()].join(", ");
             params.extend(set.iter().cloned());
-            format!("{alias}.{c} {negate}IN ({marks})")
+            format!("{} {negate}IN ({marks})", col(c))
         }
         Pred::IdIn(ids) => {
             if ids.is_empty() {
@@ -739,7 +755,7 @@ fn pred_sql(
         Pred::Between(c, lo, hi) => {
             params.push(lo.clone());
             params.push(hi.clone());
-            format!("{alias}.{c} BETWEEN ? AND ?")
+            format!("{} BETWEEN ? AND ?", col(c))
         }
         Pred::And(a, b) => format!(
             "({} AND {})",
@@ -766,12 +782,11 @@ fn pred_sql(
             } else {
                 let fts = ctx.idx.fts_of(table).ok_or(CompileErr::NoFts)?;
                 params.push(Value::Text(query.clone()));
-                // The `MATCH` operand is the index's bare name even when the table is
-                // schema-qualified (an attached database): `catalog.t_fts MATCH` is a
-                // syntax error, `t_fts MATCH` inside `FROM catalog.t_fts` is not.
-                let fts_bare = fts.rsplit('.').next().unwrap_or(&fts);
                 let fts_key = ctx.idx.fts_key_of(table);
-                format!("{alias}.{key} IN (SELECT {fts_key} FROM {fts} WHERE {fts_bare} MATCH ?)")
+                format!(
+                    "{alias}.{key} IN (SELECT {fts_key} FROM {} WHERE {} MATCH ?)",
+                    fts.from, fts.match_col
+                )
             }
         }
         Pred::Within {
@@ -787,7 +802,11 @@ fn pred_sql(
                 params.push(Value::Real(*max_lat));
                 params.push(Value::Real(*min_lon));
                 params.push(Value::Real(*max_lon));
-                format!("({alias}.{lat} BETWEEN ? AND ? AND {alias}.{lon} BETWEEN ? AND ?)")
+                format!(
+                    "({} BETWEEN ? AND ? AND {} BETWEEN ? AND ?)",
+                    col(lat),
+                    col(lon)
+                )
             };
             // The R*Tree shadow narrows first when this is the declared pair: its 32-bit
             // entries are outward-rounded (a candidate superset, never a miss), and the exact
@@ -820,32 +839,33 @@ fn pred_sql(
                 .ok_or(CompileErr::Unwired(owner, field))?;
             let r = format!("day_r{}", *aliases);
             *aliases += 1;
+            let target_sql = ctx.idx.table_sql(target);
             let (from, tie, inner_alias, inner_key) = match &rel {
                 RelSql::Children {
                     target_key,
                     fk_col,
                     owner_key,
                 } => (
-                    format!("{target} AS {r}"),
-                    format!("{r}.{fk_col} = {alias}.{owner_key}"),
+                    format!("{target_sql} AS {r}"),
+                    format!("{r}.{} = {}", ident(fk_col), col(owner_key)),
                     r.clone(),
-                    target_key.clone(),
+                    ident(target_key),
                 ),
                 RelSql::Referent { target_key, fk_col } => (
-                    format!("{target} AS {r}"),
-                    format!("{r}.{target_key} = {alias}.{fk_col}"),
+                    format!("{target_sql} AS {r}"),
+                    format!("{r}.{} = {}", ident(target_key), col(fk_col)),
                     r.clone(),
-                    target_key.clone(),
+                    ident(target_key),
                 ),
                 RelSql::Linked {
                     local_col,
                     remote_col,
                     target_key,
                 } => (
-                    format!("{target} AS {r}"),
-                    format!("{r}.{remote_col} = {alias}.{local_col}"),
+                    format!("{target_sql} AS {r}"),
+                    format!("{r}.{} = {}", ident(remote_col), col(local_col)),
                     r.clone(),
-                    target_key.clone(),
+                    ident(target_key),
                 ),
                 RelSql::Join {
                     join_table,
@@ -858,11 +878,14 @@ fn pred_sql(
                     *aliases += 1;
                     (
                         format!(
-                            "{join_table} AS {j} JOIN {target} AS {r} ON {r}.{target_key} = {j}.{target_col}"
+                            "{} AS {j} JOIN {target_sql} AS {r} ON {r}.{} = {j}.{}",
+                            ctx.idx.table_sql(join_table),
+                            ident(target_key),
+                            ident(target_col)
                         ),
-                        format!("{j}.{owner_col} = {alias}.{owner_key}"),
+                        format!("{j}.{} = {}", ident(owner_col), col(owner_key)),
                         r.clone(),
-                        target_key.clone(),
+                        ident(target_key),
                     )
                 }
             };

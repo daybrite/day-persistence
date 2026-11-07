@@ -213,6 +213,15 @@ created `STRICT` when the engine accepts the keyword (always, for the bundled bu
 otherwise. `#[obs(skip)]` removes a field from both halves; a field the change log cannot name
 could never mark its row dirty, so persisting it would silently lose edits.
 
+Any string is a table or column name. Every statement the container writes quotes its
+identifiers (`"order"`, `"it's ""my"" notes"`), so a field called `order` or `group`, a
+`table = "…"` with a space, a quote or an emoji in it, and a column named `excluded` or `new`
+all work as declared; the derive refuses only an empty name, a NUL, and two fields whose
+column names differ by ASCII case alone (SQLite would call them one column). The plain names
+are what `Model::TABLE`, `Model::KEY` and `COLUMNS` carry, what `sqlite_master` lists, and
+what `query_raw` takes in its table list. Raw SQL an app writes against those tables should
+quote them the same way; `day_persistence::ident(name)` gives the quoted form.
+
 `derive(Model)` compiles on every target, the web included. A build that keeps its web tier
 on plain stores, without day-persistence in that target's graph at all, can swap the derive
 instead: `Observable` accepts `#[model(…)]`, reads `#[model(id)]` as the key, and ignores the

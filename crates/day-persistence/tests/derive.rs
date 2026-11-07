@@ -150,13 +150,13 @@ fn the_derive_drives_the_container_end_to_end() {
     let ddl = log
         .sql()
         .into_iter()
-        .find(|s| s.starts_with("CREATE TABLE trips"))
+        .find(|s| s.starts_with("CREATE TABLE \"trips\""))
         .expect("DDL issued");
-    assert!(ddl.contains("id INTEGER PRIMARY KEY"), "{ddl}");
-    assert!(ddl.contains("name TEXT NOT NULL UNIQUE"), "{ddl}");
-    assert!(ddl.contains("rating REAL"), "{ddl}");
-    assert!(!ddl.contains("rating REAL NOT NULL"), "{ddl}");
-    assert!(ddl.contains("note_text TEXT"), "{ddl}");
+    assert!(ddl.contains("\"id\" INTEGER PRIMARY KEY"), "{ddl}");
+    assert!(ddl.contains("\"name\" TEXT NOT NULL UNIQUE"), "{ddl}");
+    assert!(ddl.contains("\"rating\" REAL"), "{ddl}");
+    assert!(!ddl.contains("\"rating\" REAL NOT NULL"), "{ddl}");
+    assert!(ddl.contains("\"note_text\" TEXT"), "{ddl}");
     assert!(
         log.sql()
             .iter()
@@ -181,7 +181,7 @@ fn the_derive_drives_the_container_end_to_end() {
     assert_eq!(
         sql,
         [
-            "INSERT INTO trips (id, name, start_day, done, rating, note_text, duration_s, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, start_day = excluded.start_day, done = excluded.done, rating = excluded.rating, note_text = excluded.note_text, duration_s = excluded.duration_s, tags = excluded.tags"
+            "INSERT INTO \"trips\" (\"id\", \"name\", \"start_day\", \"done\", \"rating\", \"note_text\", \"duration_s\", \"tags\") VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"start_day\" = excluded.\"start_day\", \"done\" = excluded.\"done\", \"rating\" = excluded.\"rating\", \"note_text\" = excluded.\"note_text\", \"duration_s\" = excluded.\"duration_s\", \"tags\" = excluded.\"tags\""
         ]
     );
 
@@ -199,7 +199,7 @@ fn the_derive_drives_the_container_end_to_end() {
         .expect("save");
     assert_eq!(
         sql,
-        ["UPDATE trips SET note_text = ? WHERE id = ?"],
+        ["UPDATE \"trips\" SET \"note_text\" = ? WHERE \"id\" = ?"],
         "the change label is the FIELD name; the fold maps it to the renamed column"
     );
 }

@@ -60,7 +60,7 @@ fn open_reads_no_rows() {
         !trace
             .borrow()
             .iter()
-            .any(|s| s.starts_with("SELECT id, bucket, name")),
+            .any(|s| s.starts_with("SELECT \"id\", \"bucket\", \"name\"")),
         "open issued a row SELECT: {:?}",
         trace.borrow()
     );
@@ -79,7 +79,7 @@ fn a_batch_fault_is_one_select() {
     let selects: Vec<String> = trace
         .borrow()
         .iter()
-        .filter(|s| s.starts_with("SELECT id, bucket, name"))
+        .filter(|s| s.starts_with("SELECT \"id\", \"bucket\", \"name\""))
         .cloned()
         .collect();
     assert_eq!(selects.len(), 1, "fifty rows, one SELECT: {selects:?}");

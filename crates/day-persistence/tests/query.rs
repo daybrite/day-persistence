@@ -103,7 +103,7 @@ fn a_column_the_query_never_mentions_costs_nothing() {
 
     let requeries = |t: &[String]| {
         t.iter()
-            .filter(|s| s.starts_with("SELECT trips.id FROM trips"))
+            .filter(|s| s.starts_with("SELECT \"trips\".\"id\" FROM \"trips\""))
             .count()
     };
     let baseline = requeries(&trace.borrow());
@@ -337,9 +337,9 @@ fn queries_work_against_the_recorder_too() {
     assert_eq!(q.ids(), [1], "fixtures answer the compiled SELECT");
     // The Recorder's real value now: the compiled SQL is assertable, headlessly.
     assert!(
-        log.sql()
-            .iter()
-            .any(|s| s.starts_with("SELECT trips.id FROM trips WHERE instr(trips.name, ?) > 0")),
+        log.sql().iter().any(|s| s.starts_with(
+            "SELECT \"trips\".\"id\" FROM \"trips\" WHERE instr(\"trips\".\"name\", ?) > 0"
+        )),
         "recorded: {:?}",
         log.sql()
     );
@@ -377,14 +377,14 @@ fn a_count_query_stays_live_without_holding_ids() {
         trace
             .borrow()
             .iter()
-            .any(|s| s.starts_with("SELECT COUNT(*) FROM trips")),
+            .any(|s| s.starts_with("SELECT COUNT(*) FROM \"trips\"")),
         "the badge form is one COUNT: {:?}",
         trace.borrow()
     );
 
     let counts = |t: &[String]| {
         t.iter()
-            .filter(|s| s.starts_with("SELECT COUNT(*) FROM trips"))
+            .filter(|s| s.starts_with("SELECT COUNT(*) FROM \"trips\""))
             .count()
     };
     let baseline = counts(&trace.borrow());

@@ -218,7 +218,10 @@ fn adding_through_the_many_writes_the_foreign_key() {
             assert!(trips.elem(2).lodging().add(10));
         })
         .expect("flush");
-    assert_eq!(sql, ["UPDATE lodging SET trip = ? WHERE id = ?"]);
+    assert_eq!(
+        sql,
+        ["UPDATE \"lodging\" SET \"trip\" = ? WHERE \"id\" = ?"]
+    );
     assert_eq!(lodging.elem(10).trip().peek().id(), Some(ModelId::of(2u32)));
     assert_eq!(trips.elem(1).lodging().ids(), [11]);
     assert_eq!(trips.elem(2).lodging().ids(), [10, 12], "ascending by id");
@@ -250,8 +253,8 @@ fn cascade_deletes_children_with_the_parent_in_one_flush() {
     );
     // Two tables, two statements: the parent by key, its two children as one `IN`.
     assert_eq!(sql.len(), 2, "{sql:?}");
-    assert_eq!(sql[0], "DELETE FROM trips WHERE id = ?");
-    assert_eq!(sql[1], "DELETE FROM lodging WHERE id IN (?, ?)");
+    assert_eq!(sql[0], "DELETE FROM \"trips\" WHERE \"id\" = ?");
+    assert_eq!(sql[1], "DELETE FROM \"lodging\" WHERE \"id\" IN (?, ?)");
 }
 
 #[test]
@@ -395,7 +398,7 @@ fn nullify_clears_optional_references_and_the_children_survive() {
     assert_eq!(books.elem(10).author().peek(), None, "reference cleared");
     assert!(
         sql.iter()
-            .any(|s| s.starts_with("UPDATE books SET author = ?")),
+            .any(|s| s.starts_with("UPDATE \"books\" SET \"author\" = ?")),
         "the nullify folded to UPDATE statements: {sql:?}"
     );
 }
@@ -466,7 +469,7 @@ fn ordered_children_read_in_order_and_a_move_writes_one_row() {
         .expect("flush");
     assert_eq!(lists.elem(1).tracks().ids(), [12, 10, 11]);
     assert_eq!(sql.len(), 1, "{sql:?}");
-    assert!(sql[0].starts_with("UPDATE tracks SET position = ?"));
+    assert!(sql[0].starts_with("UPDATE \"tracks\" SET \"position\" = ?"));
 }
 
 #[test]
@@ -769,7 +772,10 @@ fn a_renamed_foreign_key_column_still_wires_and_folds() {
                 assert!(crates.elem(2).bottles().add(10));
             })
             .expect("flush");
-        assert_eq!(sql, ["UPDATE bottles SET crate_id = ? WHERE id = ?"]);
+        assert_eq!(
+            sql,
+            ["UPDATE \"bottles\" SET \"crate_id\" = ? WHERE \"id\" = ?"]
+        );
         assert_eq!(crates.elem(2).bottles().ids(), [10]);
         assert!(crates.elem(1).bottles().is_empty());
     }
@@ -864,7 +870,10 @@ fn a_self_referential_cascade_flushes_as_one_statement() {
     assert!(nodes.keys().is_empty(), "the whole subtree went");
     // One table, one shape: five rows leave in a single statement.
     assert_eq!(sql.len(), 1, "{sql:?}");
-    assert_eq!(sql[0], "DELETE FROM nodes WHERE id IN (?, ?, ?, ?, ?)");
+    assert_eq!(
+        sql[0],
+        "DELETE FROM \"nodes\" WHERE \"id\" IN (?, ?, ?, ?, ?)"
+    );
 }
 
 #[test]
@@ -959,7 +968,10 @@ fn identical_updates_across_rows_flush_as_one_statement() {
         })
         .expect("flush");
     assert_eq!(sql.len(), 1, "{sql:?}");
-    assert_eq!(sql[0], "UPDATE lodging SET name = ? WHERE id IN (?, ?, ?)");
+    assert_eq!(
+        sql[0],
+        "UPDATE \"lodging\" SET \"name\" = ? WHERE \"id\" IN (?, ?, ?)"
+    );
 
     // Different values cannot share a statement.
     let sql = c
@@ -971,7 +983,7 @@ fn identical_updates_across_rows_flush_as_one_statement() {
     assert_eq!(sql.len(), 2, "{sql:?}");
     assert!(
         sql.iter()
-            .all(|s| s == "UPDATE lodging SET name = ? WHERE id = ?")
+            .all(|s| s == "UPDATE \"lodging\" SET \"name\" = ? WHERE \"id\" = ?")
     );
 
     // A different column set is a different statement too, and the values still land.
@@ -1010,7 +1022,10 @@ fn a_batched_update_reaches_the_file_for_every_row() {
                 trips.elem(2).name().write("after".into());
             })
             .expect("flush");
-        assert_eq!(sql, ["UPDATE trips SET name = ? WHERE id IN (?, ?)"]);
+        assert_eq!(
+            sql,
+            ["UPDATE \"trips\" SET \"name\" = ? WHERE \"id\" IN (?, ?)"]
+        );
     }
     {
         let c = ModelContainer::open(Sqlite::at(&path), schema![Trip, Lodging]).expect("reopen");

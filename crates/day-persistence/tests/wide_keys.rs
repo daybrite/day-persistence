@@ -111,7 +111,7 @@ fn the_fold_binds_typed_key_parameters() {
     let insert = log
         .entries()
         .into_iter()
-        .find(|(sql, _)| sql.starts_with("INSERT INTO contacts"))
+        .find(|(sql, _)| sql.starts_with("INSERT INTO \"contacts\""))
         .expect("the insert statement");
     assert_eq!(
         insert.1.first(),
@@ -122,11 +122,14 @@ fn the_fold_binds_typed_key_parameters() {
     let sql = c
         .record_sql(|| store.elem(id).name().write("Alan Turing".into()))
         .expect("update flush");
-    assert_eq!(sql, ["UPDATE contacts SET name = ? WHERE id = ?"]);
+    assert_eq!(
+        sql,
+        ["UPDATE \"contacts\" SET \"name\" = ? WHERE \"id\" = ?"]
+    );
     let update = log
         .entries()
         .into_iter()
-        .rfind(|(s, _)| s.starts_with("UPDATE contacts"))
+        .rfind(|(s, _)| s.starts_with("UPDATE \"contacts\""))
         .expect("the update statement");
     assert_eq!(update.1.last(), Some(&Value::Blob(id.as_bytes().to_vec())));
 
@@ -137,7 +140,7 @@ fn the_fold_binds_typed_key_parameters() {
             })
         })
         .expect("delete flush");
-    assert_eq!(sql, ["DELETE FROM contacts WHERE id = ?"]);
+    assert_eq!(sql, ["DELETE FROM \"contacts\" WHERE \"id\" = ?"]);
 }
 
 #[test]
@@ -268,7 +271,7 @@ fn undo_writes_inverse_statements_with_blob_keys() {
         .expect("undo flush");
     assert_eq!(sql.len(), 1);
     assert!(
-        sql[0].starts_with("INSERT INTO contacts"),
+        sql[0].starts_with("INSERT INTO \"contacts\""),
         "undoing a delete is one INSERT: {sql:?}"
     );
     assert_eq!(store.elem(id).name().peek(), "Grace");

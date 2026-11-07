@@ -382,7 +382,7 @@ fn compiled(pred: Pred) -> (String, Vec<Value>) {
     log.entries()
         .into_iter()
         .rev()
-        .find(|(sql, _)| sql.starts_with("SELECT papers.id FROM papers"))
+        .find(|(sql, _)| sql.starts_with("SELECT \"papers\".\"id\" FROM \"papers\""))
         .expect("a compiled SELECT was recorded")
 }
 
@@ -394,7 +394,7 @@ fn the_empty_set_compiles_to_a_constant_not_to_in_nothing() {
     assert!(params.is_empty());
     let (sql, _) = compiled(Pred::NotIn("pages", vec![]));
     assert!(
-        sql.contains("WHERE papers.pages IS NOT NULL"),
+        sql.contains("WHERE \"papers\".\"pages\" IS NOT NULL"),
         "NOT IN () is every row with a present value: {sql}"
     );
     let (sql, _) = compiled(Pred::IdIn(vec![]));
@@ -404,15 +404,18 @@ fn the_empty_set_compiles_to_a_constant_not_to_in_nothing() {
 #[test]
 fn set_and_prefix_forms_bind_what_they_say() {
     let (sql, params) = compiled(Pred::In("pages", vec![Value::Int(1), Value::Int(2)]));
-    assert!(sql.contains("papers.pages IN (?, ?)"), "{sql}");
+    assert!(sql.contains("\"papers\".\"pages\" IN (?, ?)"), "{sql}");
     assert_eq!(params, [Value::Int(1), Value::Int(2)]);
 
     let (sql, _) = compiled(Pred::NotIn("pages", vec![Value::Int(3)]));
-    assert!(sql.contains("papers.pages NOT IN (?)"), "{sql}");
+    assert!(sql.contains("\"papers\".\"pages\" NOT IN (?)"), "{sql}");
 
     // Prefix binds a character count, not a byte count: `substr` counts characters.
     let (sql, params) = compiled(Pred::StartsWith("title", "École".into()));
-    assert!(sql.contains("substr(papers.title, 1, ?) = ?"), "{sql}");
+    assert!(
+        sql.contains("substr(\"papers\".\"title\", 1, ?) = ?"),
+        "{sql}"
+    );
     assert_eq!(params[0], Value::Int(5), "5 characters, not 6 bytes");
 }
 

@@ -36,7 +36,7 @@ use day_model::{ApplyField, Keyed, ModelId, Op, Store, announce, field_id};
 
 use crate::{
     ColumnValue, ContainerInner, DbError, DbErrorKind, DirtyRow, Model, ModelContainer, Row,
-    SqlType, Value, key_param, value_to_handle,
+    SqlType, TableName, Value, ident, key_param, value_to_handle,
 };
 
 // ---------------------------------------------------------------------------
@@ -347,6 +347,8 @@ pub(crate) struct ToOneRel {
     pub(crate) parent_key_col: &'static str,
     pub(crate) child_store: u64,
     pub(crate) child_table: &'static str,
+    /// `child_table` as the lazy reads below name it.
+    pub(crate) child_sql: String,
     pub(crate) child_key_col: &'static str,
     /// The foreign key as the child's field (the change log's language) and column (SQL's).
     pub(crate) fk_field: &'static str,
@@ -383,13 +385,13 @@ impl ToOneRel {
             return hit.clone();
         }
         let Some(mut ids) = self.with_container(|c| {
-            let order = self.ord_col.unwrap_or(self.child_key_col);
+            let order = ident(self.ord_col.unwrap_or(self.child_key_col));
             c.select_id_column(
                 &format!(
                     "SELECT {k} FROM {t} WHERE {fk} = ? ORDER BY {order}, {k}",
-                    k = self.child_key_col,
-                    t = self.child_table,
-                    fk = self.fk_col,
+                    k = ident(self.child_key_col),
+                    t = self.child_sql,
+                    fk = ident(self.fk_col),
                 ),
                 &[key_param(parent)],
             )
@@ -449,9 +451,9 @@ impl ToOneRel {
             c.select_id_column(
                 &format!(
                     "SELECT {fk} FROM {t} WHERE {k} = ?",
-                    fk = self.fk_col,
-                    t = self.child_table,
-                    k = self.child_key_col,
+                    fk = ident(self.fk_col),
+                    t = self.child_sql,
+                    k = ident(self.child_key_col),
                 ),
                 &[key_param(child)],
             )
@@ -471,9 +473,10 @@ impl ToOneRel {
         self.with_container(|c| {
             c.select_real(
                 &format!(
-                    "SELECT {col} FROM {t} WHERE {k} = ?",
-                    t = self.child_table,
-                    k = self.child_key_col,
+                    "SELECT {} FROM {t} WHERE {k} = ?",
+                    ident(col),
+                    t = self.child_sql,
+                    k = ident(self.child_key_col),
                 ),
                 &[key_param(child)],
             )
@@ -577,9 +580,9 @@ impl ToOneRel {
             c.select_id_column(
                 &format!(
                     "SELECT {fk} FROM {t} WHERE {k} = ?",
-                    fk = self.fk_col,
-                    t = self.child_table,
-                    k = self.child_key_col,
+                    fk = ident(self.fk_col),
+                    t = self.child_sql,
+                    k = ident(self.child_key_col),
                 ),
                 &[key_param(child)],
             )
@@ -753,6 +756,7 @@ pub fn wire_to_many<P: Model, C: Model>(
         parent_key_col: P::KEY,
         child_store: child_store.store_id(),
         child_table: C::TABLE,
+        child_sql: TableName::of::<C>().sql(),
         child_key_col: C::KEY,
         fk_field: inverse,
         fk_col: col.name,
@@ -821,6 +825,8 @@ impl ApplyField for JoinRow {
 pub(crate) struct JoinRel {
     pub(crate) container: Weak<ContainerInner>,
     pub(crate) join_table: &'static str,
+    /// `join_table` as the lazy reads below name it.
+    pub(crate) join_sql: String,
     pub(crate) parent_col: &'static str,
     pub(crate) child_col: &'static str,
     /// The side that wired first: its rows are the join row's `parent`.
@@ -875,16 +881,17 @@ impl JoinRel {
         } else {
             (self.child_col, self.parent_col)
         };
+        let (other_col, own_col) = (ident(other_col), ident(own_col));
         let order = if self.ordered && forward {
             format!("position, {other_col}")
         } else {
-            other_col.to_string()
+            other_col.clone()
         };
         let Some(mut ids) = self.with_container(|c| {
             c.select_id_column(
                 &format!(
                     "SELECT {other_col} FROM {t} WHERE {own_col} = ? ORDER BY {order}",
-                    t = self.join_table,
+                    t = self.join_sql,
                 ),
                 &[key_param(key)],
             )
@@ -958,9 +965,9 @@ impl JoinRel {
             c.select_real(
                 &format!(
                     "SELECT position FROM {t} WHERE {pc} = ? AND {cc} = ?",
-                    t = self.join_table,
-                    pc = self.parent_col,
-                    cc = self.child_col,
+                    t = self.join_sql,
+                    pc = ident(self.parent_col),
+                    cc = ident(self.child_col),
                 ),
                 &[key_param(parent), key_param(child)],
             )
@@ -984,9 +991,9 @@ impl JoinRel {
             !c.select_id_column(
                 &format!(
                     "SELECT 1 FROM {t} WHERE {pc} = ? AND {cc} = ?",
-                    t = self.join_table,
-                    pc = self.parent_col,
-                    cc = self.child_col,
+                    t = self.join_sql,
+                    pc = ident(self.parent_col),
+                    cc = ident(self.child_col),
                 ),
                 &[key_param(parent), key_param(child)],
             )
@@ -1234,6 +1241,7 @@ pub fn wire_join<P: Model, C: Model>(
     let rel = Rc::new(JoinRel {
         container: Rc::downgrade(&container.inner),
         join_table,
+        join_sql: ident(join_table),
         parent_col,
         child_col,
         a_store: parent_store.store_id(),
@@ -1764,30 +1772,30 @@ impl ModelContainer {
         } else {
             ""
         };
+        let index = ident(&format!("day_idx_{table}_{child_col}"));
+        let (table, parent_col, child_col) = (ident(table), ident(parent_col), ident(child_col));
         let body = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
              {parent_col} {} NOT NULL REFERENCES {}({}) ON DELETE {} DEFERRABLE INITIALLY DEFERRED, \
              {child_col} {} NOT NULL REFERENCES {}({}) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED\
              {position}, PRIMARY KEY ({parent_col}, {child_col}))",
             P::KEY_SQL.ddl(),
-            P::TABLE,
-            P::KEY,
+            TableName::of::<P>().sql(),
+            ident(P::KEY),
             if delete == DeleteRule::Deny {
                 "RESTRICT"
             } else {
                 "CASCADE"
             },
             C::KEY_SQL.ddl(),
-            C::TABLE,
-            C::KEY,
+            TableName::of::<C>().sql(),
+            ident(C::KEY),
         );
         if self.conn().execute(&format!("{body} STRICT"), &[]).is_err() {
             self.conn().execute(&body, &[])?;
         }
         self.conn().execute(
-            &format!(
-                "CREATE INDEX IF NOT EXISTS day_idx_{table}_{child_col} ON {table}({child_col})"
-            ),
+            &format!("CREATE INDEX IF NOT EXISTS {index} ON {table}({child_col})"),
             &[],
         )?;
         Ok(())
@@ -1836,15 +1844,17 @@ impl ModelContainer {
                 )),
             }
         };
+        let (pc, cc) = (ident(parent_col), ident(child_col));
         let hooks = crate::TableHooks {
             table,
+            name: TableName::plain(table),
             key_cols: vec![parent_col.to_string(), child_col.to_string()],
             key_where: Rc::new(move |h| match day_model::Key::of_handle(h) {
                 Some(day_model::Key::Pair(p, c)) => (
-                    format!("{parent_col} = ? AND {child_col} = ?"),
+                    format!("{pc} = ? AND {cc} = ?"),
                     vec![key_param(p), key_param(c)],
                 ),
-                _ => (format!("{parent_col} IS NULL"), Vec::new()),
+                _ => (format!("{pc} IS NULL"), Vec::new()),
             }),
             columns,
             fields,

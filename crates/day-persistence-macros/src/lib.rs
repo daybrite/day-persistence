@@ -192,7 +192,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
     // qualified `TABLE` constant gives every existing code path at once.
     let table = match &def.external {
         Some(alias) => format!("{alias}.{bare_table}"),
-        None => bare_table,
+        None => bare_table.clone(),
     };
     let persisted: Vec<&FieldDef> = def.fields.iter().filter(|f| f.persisted()).collect();
     for f in def.fields.iter().filter(|f| f.link.is_some()) {
@@ -205,11 +205,32 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         }
     }
 
+    // Names reach SQL quoted, so any string is a table or column name here; the two things
+    // SQLite cannot take are an empty name and a NUL (which ends the statement text early).
+    check_name("table", &bare_table)?;
+    for f in &persisted {
+        check_name(&format!("column of field `{}`", f.name), f.column_name())?;
+    }
+    for (i, f) in persisted.iter().enumerate() {
+        let twin = persisted[..i]
+            .iter()
+            .find(|p| p.column_name().eq_ignore_ascii_case(f.column_name()));
+        if let Some(twin) = twin {
+            return Err(format!(
+                "Model: fields `{}` and `{}` of `{name}` both store in column {:?} (SQLite \
+                 compares column names without case)",
+                twin.name,
+                f.name,
+                f.column_name()
+            ));
+        }
+    }
+
     let mut columns = String::new();
     for f in &persisted {
         let sql = sql_type_expr(f);
         columns.push_str(&format!(
-            "        day_persistence::ColumnDef {{ name: \"{}\", field: \"{}\", sql: {sql}, \
+            "        day_persistence::ColumnDef {{ name: {:?}, field: \"{}\", sql: {sql}, \
              not_null: {}, unique: {}, indexed: {} }},\n",
             f.column_name(),
             f.name,
@@ -245,7 +266,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             format!(
                 "&[{}]",
                 cols.iter()
-                    .map(|c| format!("\"{c}\""))
+                    .map(|c| format!("{c:?}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -284,7 +305,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         };
         cols.push_str(&format!(
             "    pub fn {}() -> day_persistence::Col<{}> {{\n\
-             \x20       day_persistence::Col::new(\"{}\", \"{}\", \"{table}\", {encode})\n\
+             \x20       day_persistence::Col::new({:?}, \"{}\", {table:?}, {encode})\n\
              \x20   }}\n",
             f.name,
             f.ty,
@@ -299,7 +320,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         let r = f.relation.as_ref().expect("filtered");
         cols.push_str(&format!(
             "    pub fn {}() -> day_persistence::RelationCol<{name}, {}> {{\n\
-             \x20       day_persistence::RelationCol::new(\"{}\", \"{table}\", \
+             \x20       day_persistence::RelationCol::new(\"{}\", {table:?}, \
              <{} as day_persistence::Model>::TABLE)\n\
              \x20   }}\n",
             f.name, r.target, f.name, r.target,
@@ -312,7 +333,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         let l = f.link.as_ref().expect("filtered");
         cols.push_str(&format!(
             "    pub fn {}() -> day_persistence::RelationCol<{name}, {}> {{\n\
-             \x20       day_persistence::RelationCol::new(\"{}\", \"{table}\", \
+             \x20       day_persistence::RelationCol::new(\"{}\", {table:?}, \
              <{} as day_persistence::Model>::TABLE)\n\
              \x20   }}\n",
             f.name, l.target, f.name, l.target,
@@ -328,7 +349,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
     if let Some((lat, lon)) = &def.spatial {
         cols.push_str(&format!(
             "    pub fn geo() -> day_persistence::GeoRef {{\n\
-             \x20       day_persistence::GeoRef {{ lat: \"{lat}\", lon: \"{lon}\" }}\n\
+             \x20       day_persistence::GeoRef {{ lat: {lat:?}, lon: {lon:?} }}\n\
              \x20   }}\n"
         ));
     }
@@ -346,7 +367,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         _ => "day_persistence::DeleteRule::Nullify",
     };
     let opt_str = |o: &Option<String>| match o {
-        Some(s) => format!("Some(\"{s}\")"),
+        Some(s) => format!("Some({s:?})"),
         None => "None".into(),
     };
     let relations_const = if rels.is_empty() {
@@ -357,7 +378,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             rels.iter()
                 .map(|(f, r)| format!(
                     "        day_persistence::RelationDef {{ field: \"{}\", target_table: \
-                     <{} as day_persistence::Model>::TABLE, inverse: \"{}\", delete: {}, \
+                     <{} as day_persistence::Model>::TABLE, inverse: {:?}, delete: {}, \
                      ordered: {}, join: {} }},\n",
                     f.name,
                     r.target,
@@ -378,7 +399,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
                 .map(|(f, r)| match (&r.join, &r.inverse) {
                     (Some(join), _) => format!(
                         "        day_persistence::wire_join::<Self, {}>(reg, \"{}\", \
-                         \"{join}\", {}, {});\n",
+                         {join:?}, {}, {});\n",
                         r.target,
                         f.name,
                         opt_str(&r.ordered),
@@ -386,7 +407,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
                     ),
                     (None, Some(inverse)) => format!(
                         "        day_persistence::wire_to_many::<Self, {}>(reg, \"{}\", \
-                         \"{inverse}\", {}, {});\n",
+                         {inverse:?}, {}, {});\n",
                         r.target,
                         f.name,
                         delete_expr(&r.delete),
@@ -420,17 +441,14 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         String::new()
     } else {
         let tokenize = match &def.fts_tokenize {
-            Some(t) => format!(
-                "    const FTS_TOKENIZE: Option<&'static str> = Some(\"{}\");\n",
-                t.replace('\\', "\\\\").replace('"', "\\\"")
-            ),
+            Some(t) => format!("    const FTS_TOKENIZE: Option<&'static str> = Some({t:?});\n"),
             None => String::new(),
         };
         format!(
             "    const FTS_COLUMNS: &'static [&'static str] = &[{}];\n{tokenize}",
             def.fts
                 .iter()
-                .map(|c| format!("\"{c}\""))
+                .map(|c| format!("{c:?}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -448,23 +466,24 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             links
                 .iter()
                 .map(|(f, l)| format!(
-                    "        day_persistence::LinkDef {{ field: \"{}\", local: \"{}\", \
-                     target_table: <{} as day_persistence::Model>::TABLE, remote: \"{}\" }},\n",
+                    "        day_persistence::LinkDef {{ field: \"{}\", local: {:?}, \
+                     target_table: <{} as day_persistence::Model>::TABLE, remote: {:?} }},\n",
                     f.name, l.local, l.target, l.remote
                 ))
                 .collect::<String>()
         )
     };
-    let external_const = if def.external.is_some() {
-        "    const EXTERNAL: bool = true;\n".to_string()
-    } else {
-        String::new()
+    let external_const = match &def.external {
+        Some(alias) => format!(
+            "    const EXTERNAL: bool = true;\n    const SCHEMA: Option<&'static str> = Some({alias:?});\n"
+        ),
+        None => String::new(),
     };
     let spatial_const = match &def.spatial {
         None => String::new(),
         Some((lat, lon)) => format!(
             "    const SPATIAL: Option<day_persistence::SpatialCols> = \
-             Some(day_persistence::SpatialCols {{ lat: \"{lat}\", lon: \"{lon}\" }});\n"
+             Some(day_persistence::SpatialCols {{ lat: {lat:?}, lon: {lon:?} }});\n"
         ),
     };
 
@@ -473,8 +492,8 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         + &rel_trait
         + &format!(
             "impl day_persistence::Model for {name} {{\n\
-         \x20   const TABLE: &'static str = \"{table}\";\n\
-         \x20   const KEY: &'static str = \"{key_col}\";\n\
+         \x20   const TABLE: &'static str = {table:?};\n\
+         \x20   const KEY: &'static str = {key_col:?};\n\
          \x20   const KEY_SQL: day_persistence::SqlType = {key_sql};\n\
          \x20   const COLUMNS: &'static [day_persistence::ColumnDef] = &[\n{columns}    ];\n\
          \x20   const COMPOSITE_INDEXES: &'static [&'static [&'static str]] = &[{composites}];\n\
@@ -962,13 +981,84 @@ fn literal_str(rest: &[TokenTree], field: &str) -> Result<String, String> {
     }
 }
 
+/// The string a literal token spells: `"…"` with its escapes resolved, or `r"…"`/`r#"…"#`
+/// as written. The token's text is source text, so `"say \"hi\""` has to become `say "hi"`
+/// here, not stay three characters longer.
 fn string_literal(lit: &proc_macro::Literal) -> Result<String, String> {
     let s = lit.to_string();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        Ok(s[1..s.len() - 1].to_string())
-    } else {
-        Err(format!("expected a string literal, found `{s}`"))
+    if let Some(raw) = s.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let body = &raw[hashes..raw.len() - hashes];
+        if hashes * 2 + 2 <= raw.len() && body.starts_with('"') && body.ends_with('"') {
+            return Ok(body[1..body.len() - 1].to_string());
+        }
+        return Err(format!("expected a string literal, found `{s}`"));
     }
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        return Err(format!("expected a string literal, found `{s}`"));
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s[1..s.len() - 1].chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                let code = u8::from_str_radix(&hex, 16)
+                    .map_err(|_| format!("bad escape `\\x{hex}` in {s}"))?;
+                out.push(code as char);
+            }
+            Some('u') => {
+                if chars.next() != Some('{') {
+                    return Err(format!("bad escape `\\u` in {s}"));
+                }
+                let hex: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                let code = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| format!("bad escape `\\u{{{hex}}}` in {s}"))?;
+                out.push(code);
+            }
+            // A backslash before a newline joins the lines, eating the leading whitespace.
+            Some('\n') => {
+                let rest = chars.as_str();
+                let trimmed = rest.trim_start();
+                chars = trimmed.chars();
+                let _ = rest;
+            }
+            other => {
+                return Err(format!(
+                    "unsupported escape `\\{}` in {s}",
+                    other.map(String::from).unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `name` can be a SQL identifier at all: SQLite quotes anything, but an empty name
+/// is refused and a NUL ends the statement text before the quote does.
+fn check_name(what: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("Model: the {what} name is empty"));
+    }
+    if name.contains('\0') {
+        return Err(format!(
+            "Model: the {what} name {name:?} contains a NUL, which SQL cannot carry"
+        ));
+    }
+    Ok(())
 }
 
 fn tokens_text(tokens: &[TokenTree]) -> String {

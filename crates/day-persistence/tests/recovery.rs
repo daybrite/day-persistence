@@ -37,7 +37,7 @@ impl SqliteDriver for Driver {
 impl SqliteConnection for Connection {
     fn execute(&mut self, sql: &str, p: &[Value]) -> Result<u64, DbError> {
         if (self.1.get() == 1 && sql == "BEGIN")
-            || (self.1.get() == 2 && sql.starts_with("INSERT INTO recovery_books"))
+            || (self.1.get() == 2 && sql.starts_with("INSERT INTO \"recovery_books\""))
             || (self.1.get() == 3 && sql == "COMMIT")
         {
             return Err(DbError::driver("synthetic write failure"));

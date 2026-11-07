@@ -271,7 +271,7 @@ fn trace_sql_logs_every_statement_the_engine_runs() {
     );
     assert!(
         log.iter()
-            .any(|s| s.contains("INSERT INTO traced_notes") && s.contains("'rain later'")),
+            .any(|s| s.contains("INSERT INTO \"traced_notes\"") && s.contains("'rain later'")),
         "flush logged with parameters expanded: {log:?}"
     );
 }

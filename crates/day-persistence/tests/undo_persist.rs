@@ -51,7 +51,7 @@ fn an_undone_delete_is_one_insert() {
             });
         })
         .expect("save");
-    assert_eq!(sql, ["DELETE FROM trips WHERE id = ?"]);
+    assert_eq!(sql, ["DELETE FROM \"trips\" WHERE \"id\" = ?"]);
 
     let sql = c
         .record_sql(|| {
@@ -60,7 +60,7 @@ fn an_undone_delete_is_one_insert() {
         .expect("save");
     assert_eq!(sql.len(), 1, "{sql:?}");
     assert!(
-        sql[0].starts_with("INSERT INTO trips"),
+        sql[0].starts_with("INSERT INTO \"trips\""),
         "one INSERT: {sql:?}"
     );
     assert_eq!(
@@ -74,7 +74,11 @@ fn an_undone_delete_is_one_insert() {
             assert!(stack.redo());
         })
         .expect("save");
-    assert_eq!(sql, ["DELETE FROM trips WHERE id = ?"], "redo re-deletes");
+    assert_eq!(
+        sql,
+        ["DELETE FROM \"trips\" WHERE \"id\" = ?"],
+        "redo re-deletes"
+    );
 }
 
 #[test]
@@ -94,7 +98,7 @@ fn a_sixty_move_drag_is_one_update() {
         .expect("save");
     assert_eq!(
         sql,
-        ["UPDATE trips SET start_day = ? WHERE id = ?"],
+        ["UPDATE \"trips\" SET \"start_day\" = ? WHERE \"id\" = ?"],
         "sixty thumb positions, one UPDATE"
     );
 
@@ -104,7 +108,10 @@ fn a_sixty_move_drag_is_one_update() {
             assert!(stack.undo());
         })
         .expect("save");
-    assert_eq!(sql, ["UPDATE trips SET start_day = ? WHERE id = ?"]);
+    assert_eq!(
+        sql,
+        ["UPDATE \"trips\" SET \"start_day\" = ? WHERE \"id\" = ?"]
+    );
     assert_eq!(field.peek(), 7, "back to the pre-drag value in one step");
 }
 

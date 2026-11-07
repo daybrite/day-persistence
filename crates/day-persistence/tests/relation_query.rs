@@ -27,7 +27,7 @@ fn requeries(trace: &RefCell<Vec<String>>) -> usize {
     trace
         .borrow()
         .iter()
-        .filter(|s| s.starts_with("SELECT trips.id FROM trips"))
+        .filter(|s| s.starts_with("SELECT \"trips\".\"id\" FROM \"trips\""))
         .count()
 }
 
@@ -631,11 +631,14 @@ fn a_relation_predicate_compiles_to_a_correlated_exists() {
         .sql()
         .into_iter()
         .rev()
-        .find(|s| s.starts_with("SELECT trips.id FROM trips"))
+        .find(|s| s.starts_with("SELECT \"trips\".\"id\" FROM \"trips\""))
         .expect("compiled");
-    assert!(sql.contains("EXISTS (SELECT 1 FROM lodging AS"), "{sql}");
     assert!(
-        sql.contains(".trip = trips.id"),
+        sql.contains("EXISTS (SELECT 1 FROM \"lodging\" AS"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(".\"trip\" = \"trips\".\"id\""),
         "correlated on the fk: {sql}"
     );
 }

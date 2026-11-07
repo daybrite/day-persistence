@@ -88,7 +88,7 @@ fn a_session_on_a_row_deleted_mid_gesture_stays_harmless() {
     let sql = c
         .record_sql(|| title.write_commit("never lands".into()))
         .expect("save");
-    assert_eq!(sql, ["DELETE FROM docs WHERE id = ?"]);
+    assert_eq!(sql, ["DELETE FROM \"docs\" WHERE \"id\" = ?"]);
     assert!(!store.elem(2).exists());
 }
 

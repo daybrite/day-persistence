@@ -66,7 +66,9 @@ pub use queries::{
     Col, Delta, Deps, Fetch, FtsRef, GeoRect, GeoRef, Pred, Quant, RelatedDep, RelationCol,
     ResultSet, RowView, SetChange, Sort, compare_values, encode_column, rank,
 };
-use queries::{CompileErr, RelSql, SqlIndex, compile_count, compile_fallback, compile_fetch};
+use queries::{
+    CompileErr, FtsSql, RelSql, SqlIndex, compile_count, compile_fallback, compile_fetch,
+};
 
 mod relations;
 pub use relations::{
@@ -534,10 +536,12 @@ impl SqliteConnection for RecorderConn {
             .log
             .borrow_mut()
             .push((sql.to_string(), params.to_vec()));
-        // Serve a fixture when the statement reads `FROM` a table one was registered for.
+        // Serve a fixture when the statement reads `FROM` a table one was registered for:
+        // quoted, as the container writes it, or plain, as a raw query might.
         if let Some(from) = sql.split(" FROM ").nth(1) {
-            let table = from.split_whitespace().next().unwrap_or("");
-            if let Some(rows) = self.state.fixtures.borrow().get(table) {
+            let table = quoted_name(from)
+                .unwrap_or_else(|| from.split_whitespace().next().unwrap_or("").to_string());
+            if let Some(rows) = self.state.fixtures.borrow().get(&table) {
                 for r in rows {
                     row(r);
                 }
@@ -820,6 +824,10 @@ pub trait Model: Identified + day_model::ApplyField + Clone + 'static {
     /// and managed elsewhere. The container creates, migrates, and fingerprints nothing for
     /// it, and treats it as read-only.
     const EXTERNAL: bool = false;
+    /// The alias an `EXTERNAL` table's database is attached under, the part `TABLE` is
+    /// qualified with (`catalog` in `catalog.stations`). Kept apart so SQL can quote each
+    /// half; `None` for a table in the container's own file.
+    const SCHEMA: Option<&'static str> = None;
     /// One [`Value`] per column, in `COLUMNS` order.
     fn to_row(&self) -> Vec<Value>;
     fn from_row(row: &dyn Row) -> Result<Self, DbError>;
@@ -828,6 +836,71 @@ pub trait Model: Identified + day_model::ApplyField + Clone + 'static {
     /// Wire this model's declared relations. Generated; the default declares none.
     fn wire(reg: &mut Registrar<'_>) {
         let _ = reg;
+    }
+}
+
+/// `name` as a SQL identifier: double-quoted, an embedded `"` doubled. Quoted, any name
+/// reaches the engine as itself: a keyword (`order`, `group`), a space, a quote, an emoji.
+/// Every statement the container writes names its tables and columns this way, and raw SQL
+/// written against them should too.
+pub fn ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('"');
+    for ch in name.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// A table's name in the two halves SQL quotes separately: the attached database's alias,
+/// if any, and the table's own name. [`Model::TABLE`] (`notes`, `catalog.stations`) stays the
+/// plain key every lookup, fingerprint and `_day_schema` row uses; this is what a statement
+/// gets.
+#[derive(Clone, Copy)]
+pub(crate) struct TableName {
+    pub(crate) schema: Option<&'static str>,
+    pub(crate) bare: &'static str,
+}
+
+impl TableName {
+    pub(crate) fn of<M: Model>() -> Self {
+        let bare = match M::SCHEMA {
+            Some(schema) => M::TABLE
+                .strip_prefix(schema)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .unwrap_or(M::TABLE),
+            None => M::TABLE,
+        };
+        TableName {
+            schema: M::SCHEMA,
+            bare,
+        }
+    }
+
+    /// A table in the container's own file, named directly (a join table).
+    pub(crate) fn plain(bare: &'static str) -> Self {
+        TableName { schema: None, bare }
+    }
+
+    /// The quoted SQL that names the table in a statement: `"notes"`, `"catalog"."stations"`.
+    pub(crate) fn sql(&self) -> String {
+        table_sql(self.schema, self.bare)
+    }
+
+    /// The quoted SQL naming a shadow beside the table (`_fts`, `_geo`), in the same schema.
+    pub(crate) fn shadow(&self, suffix: &str) -> String {
+        table_sql(self.schema, &format!("{}{suffix}", self.bare))
+    }
+}
+
+pub(crate) fn table_sql(schema: Option<&str>, bare: &str) -> String {
+    match schema {
+        Some(schema) => format!("{}.{}", ident(schema), ident(bare)),
+        None => ident(bare),
     }
 }
 
@@ -907,11 +980,13 @@ type EvictFn = Rc<dyn Fn(&[u64], usize) -> usize>;
 
 /// One foreign-key clause, resolved from a `RelationDef` at `Schema::with` time: the child's
 /// column carries `REFERENCES parent(key) ON DELETE …` in its generated DDL.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct FkSpec {
     child_table: &'static str,
     child_field: &'static str,
     parent_table: &'static str,
+    /// `parent_table` as the `REFERENCES` clause names it.
+    parent_sql: String,
     parent_key: &'static str,
     rule: DeleteRule,
 }
@@ -927,6 +1002,7 @@ impl Schema {
                     child_table: def.target_table,
                     child_field: def.inverse,
                     parent_table: M::TABLE,
+                    parent_sql: TableName::of::<M>().sql(),
                     parent_key: M::KEY,
                     rule: def.delete,
                 });
@@ -1100,8 +1176,11 @@ impl DirtyState {
 /// their pair-keyed membership cache, which is why keys are plural and clause-shaped here.
 pub(crate) struct TableHooks {
     pub(crate) table: &'static str,
+    /// `table` split for SQL: the statements below name it through `name.sql()`.
+    pub(crate) name: TableName,
     /// The key column(s), in order: the key SELECT list, the upsert's conflict target, and
-    /// what its DO UPDATE leaves alone. One entry everywhere but join tables.
+    /// what its DO UPDATE leaves alone. One entry everywhere but join tables. Plain names,
+    /// like `columns`; [`ident`] quotes them where a statement is written.
     pub(crate) key_cols: Vec<String>,
     /// `WHERE` clause + params addressing one row by its key handle.
     pub(crate) key_where: KeyWhere,
@@ -1546,11 +1625,10 @@ impl ModelContainer {
     /// deleted this turn stay deleted. Returns how many rows are resident afterward.
     pub fn warm<M: Model>(&self) -> Result<usize, DbError> {
         let store = self.cache::<M>();
+        let key = ident(M::KEY);
         let keys = self.select_id_column_checked(&format!(
-            "SELECT {} FROM {} ORDER BY {}",
-            M::KEY,
-            M::TABLE,
-            M::KEY
+            "SELECT {key} FROM {} ORDER BY {key}",
+            TableName::of::<M>().sql()
         ))?;
         self.fault_into(store.store_id(), &keys)?;
         Ok(store.with_untracked(|k| k.len()))
@@ -1572,7 +1650,7 @@ impl ModelContainer {
         }
         let mut n = 0i64;
         self.conn().query(
-            &format!("SELECT COUNT(*) FROM {}", M::TABLE),
+            &format!("SELECT COUNT(*) FROM {}", TableName::of::<M>().sql()),
             &[],
             &mut |row| {
                 n = row.get(0).as_int().unwrap_or(0);
@@ -1591,8 +1669,8 @@ impl ModelContainer {
             (
                 hooks.is_resident.clone(),
                 hooks.absorb.clone(),
-                hooks.columns.join(", "),
-                hooks.table,
+                column_list(&hooks.columns),
+                hooks.name.sql(),
                 keys_where_of(hooks),
             )
         };
@@ -1997,8 +2075,9 @@ impl ModelContainer {
             store_id,
             TableHooks {
                 table: M::TABLE,
+                name: TableName::of::<M>(),
                 key_cols: vec![M::KEY.to_string()],
-                key_where: Rc::new(|h| (format!("{} = ?", M::KEY), vec![key_param(h)])),
+                key_where: Rc::new(|h| (format!("{} = ?", ident(M::KEY)), vec![key_param(h)])),
                 columns,
                 fields,
                 resident_len,
@@ -2067,15 +2146,24 @@ impl ModelContainer {
         // index and fingerprint usable. Remove triggers before dropping indexed columns.
         self.conn().begin()?;
         let result = (|| {
-            let t = M::TABLE;
+            let name = TableName::of::<M>();
+            let t = name.bare;
             if self.table_exists(&format!("{t}_fts"))? {
                 for suffix in ["ai", "ad", "au"] {
-                    self.conn()
-                        .execute(&format!("DROP TRIGGER IF EXISTS {t}_fts_{suffix}"), &[])?;
+                    self.conn().execute(
+                        &format!(
+                            "DROP TRIGGER IF EXISTS {}",
+                            ident(&format!("{t}_fts_{suffix}"))
+                        ),
+                        &[],
+                    )?;
                 }
-                self.conn().execute(&format!("DROP TABLE {t}_fts"), &[])?;
                 self.conn()
-                    .execute(&format!("DROP TABLE IF EXISTS {t}_fts_keys"), &[])?;
+                    .execute(&format!("DROP TABLE {}", name.shadow("_fts")), &[])?;
+                self.conn().execute(
+                    &format!("DROP TABLE IF EXISTS {}", name.shadow("_fts_keys")),
+                    &[],
+                )?;
             }
             if !self.table_exists(M::TABLE)? {
                 self.create_table::<M>()?;
@@ -2097,29 +2185,38 @@ impl ModelContainer {
     /// the indexes stay true inside the same transaction as every write, even a write made by
     /// another tool straight into the file. Backfilled when first created.
     fn create_shadow_tables<M: Model>(&self) -> Result<(), DbError> {
-        let t = M::TABLE;
-        let key = M::KEY;
+        let name = TableName::of::<M>();
+        // The plain names, for messages and `sqlite_master` lookups; the quoted ones, for
+        // every statement. A shadow's trigger is named after the shadow, quoted as one name.
+        let bare = name.bare;
+        let t = name.sql();
+        let key = ident(M::KEY);
+        let trigger = |suffix: &str| ident(&format!("{bare}{suffix}"));
         if !M::FTS_COLUMNS.is_empty() {
             if !self.inner.caps.full_text_search {
                 return Err(DbError::new(
                     DbErrorKind::Unsupported,
                     format!(
-                        "`{t}` declares fts(…) but this driver's engine has no FTS5 — the \
+                        "`{bare}` declares fts(…) but this driver's engine has no FTS5 — the \
                          bundled and cipher engines compile it in"
                     ),
                 ));
             }
-            let cols = M::FTS_COLUMNS.join(", ");
-            let fresh = !self.table_exists(&format!("{t}_fts"))?;
+            let fts = name.shadow("_fts");
+            // The hidden column FTS5 takes its commands through carries the index's own name.
+            let fts_command = ident(&format!("{bare}_fts"));
+            let cols = column_list(M::FTS_COLUMNS);
+            let fresh = !self.table_exists(&format!("{bare}_fts"))?;
             // The tokenizer rides in the DDL; its value is a compile-time literal, quoted
             // through SQL's own escape so an apostrophe cannot break the statement.
             let tokenize = match M::FTS_TOKENIZE {
                 Some(tok) => format!(", tokenize='{}'", tok.replace('\'', "''")),
                 None => String::new(),
             };
+            let new_cols = prefixed_list("new", M::FTS_COLUMNS);
             let wide = M::COLUMNS
                 .iter()
-                .find(|c| c.name == key)
+                .find(|c| c.name == M::KEY)
                 .is_some_and(|c| c.sql != SqlType::Integer);
             if wide {
                 if M::FTS_COLUMNS.contains(&"day_key") {
@@ -2130,88 +2227,84 @@ impl ModelContainer {
                 }
                 let key_type = M::COLUMNS
                     .iter()
-                    .find(|c| c.name == key)
+                    .find(|c| c.name == M::KEY)
                     .expect("key column")
                     .sql
                     .ddl();
+                let fts_keys = name.shadow("_fts_keys");
                 // FTS rowids stay private. An indexed mapping makes update/delete O(log n)
                 // rather than scanning the unindexed public key in every FTS row.
-                self.conn().execute(&format!("CREATE TABLE IF NOT EXISTS {t}_fts_keys(day_rowid INTEGER PRIMARY KEY, day_key {key_type} NOT NULL UNIQUE)"), &[])?;
-                self.conn().execute(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {t}_fts USING fts5(day_key UNINDEXED, {cols}{tokenize})"), &[])?;
-                let new_cols = M::FTS_COLUMNS
-                    .iter()
-                    .map(|c| format!("new.{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                self.conn().execute(&format!("CREATE TABLE IF NOT EXISTS {fts_keys}(day_rowid INTEGER PRIMARY KEY, day_key {key_type} NOT NULL UNIQUE)"), &[])?;
+                self.conn().execute(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {fts} USING fts5(day_key UNINDEXED, {cols}{tokenize})"), &[])?;
                 let insert = format!(
-                    "INSERT INTO {t}_fts_keys(day_key) VALUES (new.{key}); INSERT INTO {t}_fts(rowid, day_key, {cols}) VALUES ((SELECT day_rowid FROM {t}_fts_keys WHERE day_key = new.{key}), new.{key}, {new_cols});"
+                    "INSERT INTO {fts_keys}(day_key) VALUES (new.{key}); INSERT INTO {fts}(rowid, day_key, {cols}) VALUES ((SELECT day_rowid FROM {fts_keys} WHERE day_key = new.{key}), new.{key}, {new_cols});"
                 );
                 let delete = format!(
-                    "DELETE FROM {t}_fts WHERE rowid = (SELECT day_rowid FROM {t}_fts_keys WHERE day_key = old.{key}); DELETE FROM {t}_fts_keys WHERE day_key = old.{key};"
+                    "DELETE FROM {fts} WHERE rowid = (SELECT day_rowid FROM {fts_keys} WHERE day_key = old.{key}); DELETE FROM {fts_keys} WHERE day_key = old.{key};"
                 );
                 for (suffix, event, body) in [
-                    ("ai", "INSERT", insert.clone()),
-                    ("ad", "DELETE", delete.clone()),
-                    ("au", "UPDATE", format!("{delete} {insert}")),
+                    ("_fts_ai", "INSERT", insert.clone()),
+                    ("_fts_ad", "DELETE", delete.clone()),
+                    ("_fts_au", "UPDATE", format!("{delete} {insert}")),
                 ] {
-                    self.conn().execute(&format!("CREATE TRIGGER IF NOT EXISTS {t}_fts_{suffix} AFTER {event} ON {t} BEGIN {body} END"), &[])?;
+                    self.conn().execute(
+                        &format!(
+                            "CREATE TRIGGER IF NOT EXISTS {} AFTER {event} ON {t} BEGIN {body} END",
+                            trigger(suffix)
+                        ),
+                        &[],
+                    )?;
                 }
                 if fresh {
                     self.conn().execute(
-                        &format!("INSERT INTO {t}_fts_keys(day_key) SELECT {key} FROM {t}"),
+                        &format!("INSERT INTO {fts_keys}(day_key) SELECT {key} FROM {t}"),
                         &[],
                     )?;
-                    let qualified = M::FTS_COLUMNS
-                        .iter()
-                        .map(|c| format!("b.{c}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    self.conn().execute(&format!("INSERT INTO {t}_fts(rowid, day_key, {cols}) SELECT k.day_rowid, b.{key}, {qualified} FROM {t} b JOIN {t}_fts_keys k ON k.day_key = b.{key}"), &[])?;
+                    let qualified = prefixed_list("b", M::FTS_COLUMNS);
+                    self.conn().execute(&format!("INSERT INTO {fts}(rowid, day_key, {cols}) SELECT k.day_rowid, b.{key}, {qualified} FROM {t} b JOIN {fts_keys} k ON k.day_key = b.{key}"), &[])?;
                 }
             } else {
+                // FTS5 reads its options as SQL string literals; the content table and its
+                // rowid column are plain names inside them.
                 self.conn().execute(
                     &format!(
-                        "CREATE VIRTUAL TABLE IF NOT EXISTS {t}_fts USING fts5({cols}, \
-                     content={t}, content_rowid={key}{tokenize})"
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS {fts} USING fts5({cols}, \
+                     content='{}', content_rowid='{}'{tokenize})",
+                        bare.replace('\'', "''"),
+                        M::KEY.replace('\'', "''")
                     ),
                     &[],
                 )?;
-                let new_cols = M::FTS_COLUMNS
-                    .iter()
-                    .map(|c| format!("new.{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let old_cols = M::FTS_COLUMNS
-                    .iter()
-                    .map(|c| format!("old.{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let old_cols = prefixed_list("old", M::FTS_COLUMNS);
                 self.conn().execute(
                     &format!(
-                        "CREATE TRIGGER IF NOT EXISTS {t}_fts_ai AFTER INSERT ON {t} BEGIN \
-                     INSERT INTO {t}_fts(rowid, {cols}) VALUES (new.{key}, {new_cols}); END"
+                        "CREATE TRIGGER IF NOT EXISTS {} AFTER INSERT ON {t} BEGIN \
+                     INSERT INTO {fts}(rowid, {cols}) VALUES (new.{key}, {new_cols}); END",
+                        trigger("_fts_ai")
                     ),
                     &[],
                 )?;
                 self.conn().execute(
-                &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {t}_fts_ad AFTER DELETE ON {t} BEGIN \
-                     INSERT INTO {t}_fts({t}_fts, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); END"
-                ),
-                &[],
-            )?;
+                    &format!(
+                        "CREATE TRIGGER IF NOT EXISTS {} AFTER DELETE ON {t} BEGIN \
+                     INSERT INTO {fts}({fts_command}, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); END",
+                        trigger("_fts_ad")
+                    ),
+                    &[],
+                )?;
                 self.conn().execute(
-                &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {t}_fts_au AFTER UPDATE ON {t} BEGIN \
-                     INSERT INTO {t}_fts({t}_fts, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); \
-                     INSERT INTO {t}_fts(rowid, {cols}) VALUES (new.{key}, {new_cols}); END"
-                ),
-                &[],
-            )?;
+                    &format!(
+                        "CREATE TRIGGER IF NOT EXISTS {} AFTER UPDATE ON {t} BEGIN \
+                     INSERT INTO {fts}({fts_command}, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); \
+                     INSERT INTO {fts}(rowid, {cols}) VALUES (new.{key}, {new_cols}); END",
+                        trigger("_fts_au")
+                    ),
+                    &[],
+                )?;
                 if fresh {
                     // External-content rebuild: index whatever rows predate the declaration.
                     self.conn().execute(
-                        &format!("INSERT INTO {t}_fts({t}_fts) VALUES ('rebuild')"),
+                        &format!("INSERT INTO {fts}({fts_command}) VALUES ('rebuild')"),
                         &[],
                     )?;
                 }
@@ -2222,45 +2315,49 @@ impl ModelContainer {
                 return Err(DbError::new(
                     DbErrorKind::Unsupported,
                     format!(
-                        "`{t}` declares spatial(…) but this driver's engine has no R*Tree — \
+                        "`{bare}` declares spatial(…) but this driver's engine has no R*Tree — \
                          the bundled and cipher engines compile it in"
                     ),
                 ));
             }
-            let (lat, lon) = (s.lat, s.lon);
-            let fresh = !self.table_exists(&format!("{t}_geo"))?;
+            let (lat, lon) = (ident(s.lat), ident(s.lon));
+            let geo = name.shadow("_geo");
+            let fresh = !self.table_exists(&format!("{bare}_geo"))?;
             self.conn().execute(
                 &format!(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS {t}_geo USING rtree({key}, \
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS {geo} USING rtree({key}, \
                      min_lat, max_lat, min_lon, max_lon)"
                 ),
                 &[],
             )?;
             self.conn().execute(
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {t}_geo_ai AFTER INSERT ON {t} BEGIN \
-                     INSERT OR REPLACE INTO {t}_geo VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END"
+                    "CREATE TRIGGER IF NOT EXISTS {} AFTER INSERT ON {t} BEGIN \
+                     INSERT OR REPLACE INTO {geo} VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END",
+                    trigger("_geo_ai")
                 ),
                 &[],
             )?;
             self.conn().execute(
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {t}_geo_au AFTER UPDATE OF {lat}, {lon} ON {t} BEGIN \
-                     INSERT OR REPLACE INTO {t}_geo VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END"
+                    "CREATE TRIGGER IF NOT EXISTS {} AFTER UPDATE OF {lat}, {lon} ON {t} BEGIN \
+                     INSERT OR REPLACE INTO {geo} VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END",
+                    trigger("_geo_au")
                 ),
                 &[],
             )?;
             self.conn().execute(
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {t}_geo_ad AFTER DELETE ON {t} BEGIN \
-                     DELETE FROM {t}_geo WHERE {key} = old.{key}; END"
+                    "CREATE TRIGGER IF NOT EXISTS {} AFTER DELETE ON {t} BEGIN \
+                     DELETE FROM {geo} WHERE {key} = old.{key}; END",
+                    trigger("_geo_ad")
                 ),
                 &[],
             )?;
             if fresh {
                 self.conn().execute(
                     &format!(
-                        "INSERT OR REPLACE INTO {t}_geo \
+                        "INSERT OR REPLACE INTO {geo} \
                          SELECT {key}, {lat}, {lat}, {lon}, {lon} FROM {t}"
                     ),
                     &[],
@@ -2285,7 +2382,7 @@ impl ModelContainer {
         let cols: Vec<String> = M::COLUMNS
             .iter()
             .map(|c| {
-                let mut s = format!("{} {}", c.name, c.sql.ddl());
+                let mut s = format!("{} {}", ident(c.name), c.sql.ddl());
                 if c.name == M::KEY {
                     s.push_str(" PRIMARY KEY");
                 } else if c.not_null {
@@ -2305,15 +2402,19 @@ impl ModelContainer {
                 {
                     s.push_str(&format!(
                         " REFERENCES {}({}) ON DELETE {} DEFERRABLE INITIALLY DEFERRED",
-                        spec.parent_table,
-                        spec.parent_key,
+                        spec.parent_sql,
+                        ident(spec.parent_key),
                         spec.rule.sql()
                     ));
                 }
                 s
             })
             .collect();
-        let body = format!("CREATE TABLE {} ({})", M::TABLE, cols.join(", "));
+        let body = format!(
+            "CREATE TABLE {} ({})",
+            TableName::of::<M>().sql(),
+            cols.join(", ")
+        );
         // `STRICT` where the engine allows it (always, for the bundled build); older system
         // SQLites reject the keyword, and the plain form is the fallback.
         if self.conn().execute(&format!("{body} STRICT"), &[]).is_err() {
@@ -2340,26 +2441,27 @@ impl ModelContainer {
                     .map(|c| c.name)
             })
             .collect();
+        let name = TableName::of::<M>();
+        let t = name.sql();
         for c in M::COLUMNS
             .iter()
             .filter(|c| c.indexed || (fk_cols.contains(&c.name) && c.name != M::KEY))
         {
             self.conn().execute(
                 &format!(
-                    "CREATE INDEX IF NOT EXISTS day_idx_{t}_{c} ON {t}({c})",
-                    t = M::TABLE,
-                    c = c.name
+                    "CREATE INDEX IF NOT EXISTS {} ON {t}({})",
+                    ident(&format!("day_idx_{}_{}", name.bare, c.name)),
+                    ident(c.name)
                 ),
                 &[],
             )?;
         }
         for idx in M::COMPOSITE_INDEXES {
-            let cols = idx.join(", ");
-            let name = idx.join("_");
             self.conn().execute(
                 &format!(
-                    "CREATE INDEX IF NOT EXISTS day_idx_{t}_{name} ON {t}({cols})",
-                    t = M::TABLE
+                    "CREATE INDEX IF NOT EXISTS {} ON {t}({})",
+                    ident(&format!("day_idx_{}_{}", name.bare, idx.join("_"))),
+                    column_list(idx)
                 ),
                 &[],
             )?;
@@ -2373,7 +2475,7 @@ impl ModelContainer {
     fn lightweight_migrate<M: Model>(&self) -> Result<(), DbError> {
         let mut existing: Vec<String> = Vec::new();
         self.conn().query(
-            &format!("PRAGMA table_info({})", M::TABLE),
+            &format!("PRAGMA table_info({})", TableName::of::<M>().sql()),
             &[],
             &mut |row| {
                 if let Ok(name) = row.get(1).as_text() {
@@ -2384,15 +2486,15 @@ impl ModelContainer {
 
         let declared: Vec<&'static str> = M::COLUMNS.iter().map(|c| c.name).collect();
         let defaults = M::default_row();
+        let t = TableName::of::<M>().sql();
 
         for (i, col) in M::COLUMNS.iter().enumerate() {
             if !existing.iter().any(|e| e == col.name) {
                 // Add nullable, then backfill with the field's Rust default.
                 self.conn().execute(
                     &format!(
-                        "ALTER TABLE {} ADD COLUMN {} {}",
-                        M::TABLE,
-                        col.name,
+                        "ALTER TABLE {t} ADD COLUMN {} {}",
+                        ident(col.name),
                         col.sql.ddl()
                     ),
                     &[],
@@ -2400,7 +2502,7 @@ impl ModelContainer {
                 let default = Row::get(&defaults, i);
                 if default != Value::Null {
                     self.conn().execute(
-                        &format!("UPDATE {} SET {} = ?", M::TABLE, col.name),
+                        &format!("UPDATE {t} SET {} = ?", ident(col.name)),
                         &[default],
                     )?;
                 }
@@ -2408,7 +2510,7 @@ impl ModelContainer {
         }
         for gone in existing.iter().filter(|e| !declared.iter().any(|d| d == e)) {
             self.conn()
-                .execute(&format!("ALTER TABLE {} DROP COLUMN {gone}", M::TABLE), &[])?;
+                .execute(&format!("ALTER TABLE {t} DROP COLUMN {}", ident(gone)), &[])?;
         }
         Ok(())
     }
@@ -2683,7 +2785,7 @@ impl ModelContainer {
                     if !batchable {
                         let (clause, params) = (hooks.key_where)(key);
                         deletes.push(Batch::Single(
-                            format!("DELETE FROM {} WHERE {clause}", hooks.table),
+                            format!("DELETE FROM {} WHERE {clause}", hooks.name.sql()),
                             params,
                         ));
                         continue;
@@ -2712,7 +2814,7 @@ impl ModelContainer {
                         let Some(i) = hooks.fields.iter().position(|n| n == c) else {
                             continue; // a transient field's label, never a column
                         };
-                        sets.push(format!("{} = ?", hooks.columns[i]));
+                        sets.push(format!("{} = ?", ident(&hooks.columns[i])));
                         set_params.push(row.get(i));
                     }
                     if set_params.is_empty() {
@@ -2724,7 +2826,10 @@ impl ModelContainer {
                         let mut params = set_params;
                         params.append(&mut where_params);
                         batches.push(Batch::Single(
-                            format!("UPDATE {} SET {clause} WHERE {where_clause}", hooks.table),
+                            format!(
+                                "UPDATE {} SET {clause} WHERE {where_clause}",
+                                hooks.name.sql()
+                            ),
                             params,
                         ));
                         continue;
@@ -2849,9 +2954,27 @@ impl ModelContainer {
 
 /// The multi-key `WHERE` builder for a hooks entry: `key IN (…)` for single-column keys, an OR
 /// list of pair clauses for join tables.
+/// `a, b, c` as a quoted SELECT list or insert column list.
+pub(crate) fn column_list<S: AsRef<str>>(columns: &[S]) -> String {
+    columns
+        .iter()
+        .map(|c| ident(c.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `prefix.a, prefix.b`: the same list through a table alias or a trigger's `new`/`old`.
+pub(crate) fn prefixed_list<S: AsRef<str>>(prefix: &str, columns: &[S]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("{prefix}.{}", ident(c.as_ref())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn keys_where_of(hooks: &TableHooks) -> KeysWhere {
     if hooks.key_cols.len() == 1 {
-        let col = hooks.key_cols[0].clone();
+        let col = ident(&hooks.key_cols[0]);
         Rc::new(move |keys: &[u64]| {
             let marks = vec!["?"; keys.len()].join(", ");
             (
@@ -2972,25 +3095,26 @@ fn materialize(
 ) {
     // One key keeps the `= ?` form: it is the common case by far, it reads plainly in a
     // trace, and it is one more statement shape the cache can hold.
+    let table = hooks.name.sql();
     if keys.len() == 1 {
         let (where_clause, where_params) = (hooks.key_where)(keys[0]);
         match set {
             Some((clause, mut params)) => {
                 params.extend(where_params);
                 out.push((
-                    format!("UPDATE {} SET {clause} WHERE {where_clause}", hooks.table),
+                    format!("UPDATE {table} SET {clause} WHERE {where_clause}"),
                     params,
                 ));
             }
             None => out.push((
-                format!("DELETE FROM {} WHERE {where_clause}", hooks.table),
+                format!("DELETE FROM {table} WHERE {where_clause}"),
                 where_params,
             )),
         }
         return;
     }
 
-    let key_col = &hooks.key_cols[0];
+    let key_col = ident(&hooks.key_cols[0]);
     let set_len = set.as_ref().map(|(_, p)| p.len()).unwrap_or(0);
     let cap = MAX_BOUND_PARAMS.saturating_sub(set_len).max(1);
     for chunk in keys.chunks(cap) {
@@ -3001,18 +3125,17 @@ fn materialize(
         params.extend(chunk.iter().map(|k| key_param(*k)));
         let marks = vec!["?"; chunk.len()].join(", ");
         let sql = match &set {
-            Some((clause, _)) => format!(
-                "UPDATE {} SET {clause} WHERE {key_col} IN ({marks})",
-                hooks.table
-            ),
-            None => format!("DELETE FROM {} WHERE {key_col} IN ({marks})", hooks.table),
+            Some((clause, _)) => {
+                format!("UPDATE {table} SET {clause} WHERE {key_col} IN ({marks})")
+            }
+            None => format!("DELETE FROM {table} WHERE {key_col} IN ({marks})"),
         };
         out.push((sql, params));
     }
 }
 
 fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
-    let cols = hooks.columns.join(", ");
+    let cols = column_list(&hooks.columns);
     let marks = vec!["?"; hooks.columns.len()].join(", ");
     // A true upsert, not `INSERT OR REPLACE`: the conflict path fires `UPDATE` triggers, which
     // is what keeps the generated FTS/R*Tree shadows in sync (`OR REPLACE`'s implicit delete
@@ -3021,7 +3144,7 @@ fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
         .columns
         .iter()
         .filter(|c| !hooks.key_cols.contains(c))
-        .map(|c| format!("{c} = excluded.{c}"))
+        .map(|c| format!("{0} = excluded.{0}", ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
     let conflict = if sets.is_empty() {
@@ -3032,8 +3155,8 @@ fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
     (
         format!(
             "INSERT INTO {} ({cols}) VALUES ({marks}) ON CONFLICT({}) {conflict}",
-            hooks.table,
-            hooks.key_cols.join(", ")
+            hooks.name.sql(),
+            column_list(&hooks.key_cols)
         ),
         row.to_vec(),
     )
@@ -3569,7 +3692,7 @@ impl ModelContainer {
         };
         let attach = |target: &str| -> Result<(), DbError> {
             self.conn().execute(
-                &format!("ATTACH DATABASE ? AS {alias}"),
+                &format!("ATTACH DATABASE ? AS {}", ident(alias)),
                 &[Value::Text(target.to_string())],
             )?;
             Ok(())
@@ -3601,14 +3724,13 @@ impl ModelContainer {
         if !self.inner.dirty.borrow().is_empty() {
             self.save()?;
         }
-        let prefix = format!("{alias}.");
         type Doomed = Vec<(Rc<dyn Fn() -> Vec<u64>>, EvictFn)>;
         let doomed: Doomed = self
             .inner
             .tables
             .borrow()
             .values()
-            .filter(|h| h.table.starts_with(&prefix))
+            .filter(|h| h.name.schema == Some(alias))
             .map(|h| (h.resident_keys.clone(), h.evict.clone()))
             .collect();
         for (keys, evict) in &doomed {
@@ -3616,7 +3738,7 @@ impl ModelContainer {
             let _ = evict(&resident, resident.len());
         }
         self.conn()
-            .execute(&format!("DETACH DATABASE {alias}"), &[])?;
+            .execute(&format!("DETACH DATABASE {}", ident(alias)), &[])?;
         self.inner.attached.borrow_mut().remove(position);
         self.rescan()
     }
@@ -3680,7 +3802,7 @@ impl ModelContainer {
             resident_keys: Rc<dyn Fn() -> Vec<u64>>,
             refresh: RefreshFn,
             columns: String,
-            table: &'static str,
+            table: String,
             keys_where: KeysWhere,
         }
         let jobs: Vec<RefreshJob> = {
@@ -3690,8 +3812,8 @@ impl ModelContainer {
                 .map(|h| RefreshJob {
                     resident_keys: h.resident_keys.clone(),
                     refresh: h.refresh.clone(),
-                    columns: h.columns.join(", "),
-                    table: h.table,
+                    columns: column_list(&h.columns),
+                    table: h.name.sql(),
                     keys_where: keys_where_of(h),
                 })
                 .collect()
@@ -4118,12 +4240,21 @@ impl ModelContainer {
             }
         }
     }
+    /// Whether `table` belongs to an attached database that is not attached right now. The
+    /// alias is the model's declared one, not a prefix of the name: a table of the
+    /// container's own may be called `dot.ted`.
     fn table_detached(&self, table: &str) -> bool {
-        table.split_once('.').is_some_and(|(alias, _)| {
-            alias != "main"
-                && alias != "temp"
-                && !self.inner.attached.borrow().iter().any(|a| a == alias)
-        })
+        let tables = self.inner.tables.borrow();
+        let Some(alias) = tables
+            .values()
+            .find(|h| h.table == table)
+            .and_then(|h| h.name.schema)
+        else {
+            return false;
+        };
+        alias != "main"
+            && alias != "temp"
+            && !self.inner.attached.borrow().iter().any(|a| a == alias)
     }
     fn answer_checked(&self, state: &Rc<QueryState>) -> Result<Vec<u64>, DbError> {
         // Explicit detachment is a successful transition to an empty catalog, not an I/O error.
@@ -4175,10 +4306,17 @@ impl ModelContainer {
                 .values()
                 .map(|h| TableInfo {
                     table: h.table.to_string(),
+                    sql: h.name.sql(),
                     key: h.key_cols[0].clone(),
-                    fts: h.fts.clone(),
+                    fts: h.fts.as_ref().map(|_| FtsSql {
+                        from: h.name.shadow("_fts"),
+                        match_col: ident(&format!("{}_fts", h.name.bare)),
+                    }),
                     fts_key: h.fts_key,
-                    spatial: h.spatial.clone(),
+                    spatial: h
+                        .spatial
+                        .as_ref()
+                        .map(|(lat, lon, _)| (lat.clone(), lon.clone(), h.name.shadow("_geo"))),
                 })
                 .collect(),
             rels: relations
@@ -4213,10 +4351,13 @@ impl ModelContainer {
     }
 }
 
+/// One table as the SQL compiler sees it: `table` is the plain name it is asked about,
+/// `sql` the quoted form it writes; the shadows come already quoted, the columns plain.
 struct TableInfo {
     table: String,
+    sql: String,
     key: String,
-    fts: Option<String>,
+    fts: Option<FtsSql>,
     fts_key: &'static str,
     spatial: Option<(String, String, String)>,
 }
@@ -4307,7 +4448,15 @@ impl SqlIndex for SqlSnapshot {
             .map(|t| t.key.clone())
     }
 
-    fn fts_of(&self, table: &str) -> Option<String> {
+    fn table_sql(&self, table: &str) -> String {
+        self.tables
+            .iter()
+            .find(|t| t.table == table)
+            .map(|t| t.sql.clone())
+            .unwrap_or_else(|| ident(table))
+    }
+
+    fn fts_of(&self, table: &str) -> Option<FtsSql> {
         self.tables
             .iter()
             .find(|t| t.table == table)
@@ -4337,7 +4486,9 @@ impl SqlIndex for SqlSnapshot {
 }
 
 /// Whether a statement's target table is `table`, a plain-text check over the SQL the fold
-/// itself produced (`INSERT INTO t … ON CONFLICT`, `UPDATE t SET …`, `DELETE FROM t …`).
+/// itself produced (`INSERT INTO "t" … ON CONFLICT`, `UPDATE "t" SET …`, `DELETE FROM "t" …`).
+/// The fold quotes its table names, so the name is read back through the quotes; `table` is
+/// the plain name a raw query declared.
 fn statement_touches(sql: &str, table: &str) -> bool {
     for prefix in [
         "INSERT INTO ",
@@ -4346,10 +4497,26 @@ fn statement_touches(sql: &str, table: &str) -> bool {
         "DELETE FROM ",
     ] {
         if let Some(rest) = sql.strip_prefix(prefix) {
-            return rest.split([' ', '(']).next() == Some(table);
+            return quoted_name(rest).as_deref() == Some(table);
         }
     }
     false
+}
+
+/// The identifier a quoted name at the start of `sql` spells (a doubled `"` is one quote),
+/// `None` when `sql` does not start with one.
+fn quoted_name(sql: &str) -> Option<String> {
+    let mut chars = sql.strip_prefix('"')?.chars();
+    let mut name = String::new();
+    loop {
+        match chars.next()? {
+            '"' => match chars.next() {
+                Some('"') => name.push('"'),
+                _ => return Some(name),
+            },
+            ch => name.push(ch),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

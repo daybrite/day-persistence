@@ -119,7 +119,7 @@ fn twenty_keystrokes_fold_to_one_update() {
         })
         .expect("save");
 
-    assert_eq!(sql, ["UPDATE notes SET title = ? WHERE id = ?"]);
+    assert_eq!(sql, ["UPDATE \"notes\" SET \"title\" = ? WHERE \"id\" = ?"]);
 }
 
 #[test]
@@ -159,7 +159,10 @@ fn two_fields_fold_into_one_update() {
         })
         .expect("save");
 
-    assert_eq!(sql, ["UPDATE notes SET title = ?, pinned = ? WHERE id = ?"]);
+    assert_eq!(
+        sql,
+        ["UPDATE \"notes\" SET \"title\" = ?, \"pinned\" = ? WHERE \"id\" = ?"]
+    );
 }
 
 #[test]
@@ -183,7 +186,7 @@ fn an_insert_absorbs_the_edits_that_fill_it() {
     assert_eq!(
         sql,
         [
-            "INSERT INTO notes (id, title, body, pinned) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, body = excluded.body, pinned = excluded.pinned"
+            "INSERT INTO \"notes\" (\"id\", \"title\", \"body\", \"pinned\") VALUES (?, ?, ?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"title\" = excluded.\"title\", \"body\" = excluded.\"body\", \"pinned\" = excluded.\"pinned\""
         ]
     );
 }
@@ -202,7 +205,7 @@ fn a_delete_absorbs_everything_before_it() {
         })
         .expect("save");
 
-    assert_eq!(sql, ["DELETE FROM notes WHERE id = ?"]);
+    assert_eq!(sql, ["DELETE FROM \"notes\" WHERE \"id\" = ?"]);
 }
 
 #[test]
@@ -219,7 +222,9 @@ fn rows_fault_on_demand_and_open_loads_none() {
     // row SELECT at all.
     assert!(store.keys().is_empty(), "open loads nothing");
     assert!(
-        !log.sql().iter().any(|s| s.starts_with("SELECT id, title")),
+        !log.sql()
+            .iter()
+            .any(|s| s.starts_with("SELECT \"id\", \"title\"")),
         "no row scan at open: {:?}",
         log.sql()
     );
@@ -255,7 +260,7 @@ fn opening_creates_the_table_and_stores_a_fingerprint() {
     let sql = log.sql();
     assert!(
         sql.iter()
-            .any(|s| s.starts_with("CREATE TABLE notes (id INTEGER PRIMARY KEY")),
+            .any(|s| s.starts_with("CREATE TABLE \"notes\" (\"id\" INTEGER PRIMARY KEY")),
         "table DDL was issued: {sql:?}"
     );
     assert!(
@@ -316,7 +321,7 @@ fn autosave_flushes_at_turn_end() {
     assert!(
         log.sql()
             .iter()
-            .any(|s| s.starts_with("UPDATE notes SET title")),
+            .any(|s| s.starts_with("UPDATE \"notes\" SET \"title\"")),
         "the turn's end flushed without an explicit save: {:?}",
         log.sql()
     );
@@ -446,7 +451,7 @@ fn a_transient_labeled_change_writes_nothing() {
     assert_eq!(
         sql,
         [
-            "INSERT INTO notes (id, title, body, pinned) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, body = excluded.body, pinned = excluded.pinned"
+            "INSERT INTO \"notes\" (\"id\", \"title\", \"body\", \"pinned\") VALUES (?, ?, ?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"title\" = excluded.\"title\", \"body\" = excluded.\"body\", \"pinned\" = excluded.\"pinned\""
         ],
         "a change that names no column resolves to a whole-row upsert, never silence"
     );

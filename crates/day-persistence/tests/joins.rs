@@ -147,7 +147,7 @@ fn linking_folds_to_one_insert_and_unlinking_to_one_delete() {
         .expect("flush");
     assert_eq!(sql.len(), 1, "{sql:?}");
     assert!(
-        sql[0].starts_with("INSERT INTO note_tags (tag_id, note_id)"),
+        sql[0].starts_with("INSERT INTO \"note_tags\" (\"tag_id\", \"note_id\")"),
         "{sql:?}"
     );
 
@@ -159,7 +159,7 @@ fn linking_folds_to_one_insert_and_unlinking_to_one_delete() {
         .expect("flush");
     assert_eq!(
         sql,
-        ["DELETE FROM note_tags WHERE tag_id = ? AND note_id = ?"]
+        ["DELETE FROM \"note_tags\" WHERE \"tag_id\" = ? AND \"note_id\" = ?"]
     );
 }
 
@@ -341,7 +341,7 @@ fn an_ordered_join_keeps_per_parent_order() {
     assert_eq!(courses.elem(1).readings().ids(), [12, 10, 11]);
     assert_eq!(courses.elem(2).readings().ids(), [12, 10, 11], "untouched");
     assert_eq!(sql.len(), 1, "one membership moved: {sql:?}");
-    assert!(sql[0].starts_with("UPDATE course_readings SET position = ?"));
+    assert!(sql[0].starts_with("UPDATE \"course_readings\" SET \"position\" = ?"));
 }
 
 #[test]

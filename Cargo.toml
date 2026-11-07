@@ -4,7 +4,7 @@ members = ["crates/day-persistence", "crates/day-persistence-macros", "crates/da
 exclude = ["demo"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 repository = "https://github.com/daybrite/day-persistence"
@@ -12,8 +12,8 @@ license = "MPL-2.0"
 description = "Typed SQLite persistence and browser storage for Day apps"
 
 [workspace.dependencies]
-day-persistence-macros = { path = "crates/day-persistence-macros", version = "=0.1.0" }
-day-sqlite-worker = { path = "crates/day-sqlite-worker", version = "0.1.0" }
+day-persistence-macros = { path = "crates/day-persistence-macros", version = "=0.2.0" }
+day-sqlite-worker = { path = "crates/day-sqlite-worker", version = "0.2.0" }
 day-async = "0.6"
 day-model = "0.6"
 day-reactive = "0.6"

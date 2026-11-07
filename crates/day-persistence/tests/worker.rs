@@ -1040,7 +1040,9 @@ fn wholesale_reset_clears_history_only_after_successful_commit() {
 
 #[test]
 fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_atomically() {
-    use day_persistence::{SqliteConnection, TransactionParticipant, Value, WriteOrigin};
+    use day_persistence::{
+        Refresh, RowChange, SqliteConnection, TransactionParticipant, Value, WriteOrigin,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     struct Audit(Arc<AtomicBool>);
     impl TransactionParticipant for Audit {
@@ -1052,7 +1054,8 @@ fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_at
             &self,
             c: &mut dyn SqliteConnection,
             origin: WriteOrigin,
-        ) -> Result<(), DbError> {
+            _: &[RowChange],
+        ) -> Result<Refresh, DbError> {
             c.execute(
                 "INSERT INTO audit SELECT count(*),? FROM notes",
                 &[Value::Text(format!("{origin:?}"))],
@@ -1060,7 +1063,7 @@ fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_at
             if self.0.load(Ordering::SeqCst) {
                 return Err(DbError::driver("synthetic participant failure"));
             }
-            Ok(())
+            Ok(Refresh::None)
         }
     }
     let fail = Arc::new(AtomicBool::new(false));
@@ -1159,7 +1162,8 @@ fn failed_participant_admission_rollback_closes_the_worker() {
             &self,
             _: &mut dyn day_persistence::SqliteConnection,
             _: day_persistence::WriteOrigin,
-        ) -> Result<(), DbError> {
+            _: &[day_persistence::RowChange],
+        ) -> Result<day_persistence::Refresh, DbError> {
             unreachable!()
         }
     }
@@ -1193,7 +1197,9 @@ fn failed_participant_admission_rollback_closes_the_worker() {
 
 #[test]
 fn committed_refresh_failure_preserves_revision_and_undo_including_reset() {
-    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    use day_persistence::{
+        Refresh, RowChange, SqliteConnection, TransactionParticipant, WriteOrigin,
+    };
     struct RefreshFault(Arc<std::sync::atomic::AtomicU8>);
     impl TransactionParticipant for RefreshFault {
         fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
@@ -1203,12 +1209,10 @@ fn committed_refresh_failure_preserves_revision_and_undo_including_reset() {
             &self,
             _: &mut dyn SqliteConnection,
             _: WriteOrigin,
-        ) -> Result<(), DbError> {
+            _: &[RowChange],
+        ) -> Result<Refresh, DbError> {
             self.0.store(3, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
-            true
+            Ok(Refresh::All)
         }
     }
     let flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -1262,7 +1266,9 @@ fn committed_refresh_failure_preserves_revision_and_undo_including_reset() {
 
 #[test]
 fn participant_refreshes_direct_save_autosave_and_nonlocal_worker_origins() {
-    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    use day_persistence::{
+        Refresh, RowChange, SqliteConnection, TransactionParticipant, WriteOrigin,
+    };
     struct Project;
     impl TransactionParticipant for Project {
         fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
@@ -1272,16 +1278,14 @@ fn participant_refreshes_direct_save_autosave_and_nonlocal_worker_origins() {
             &self,
             c: &mut dyn SqliteConnection,
             origin: WriteOrigin,
-        ) -> Result<(), DbError> {
+            _: &[RowChange],
+        ) -> Result<Refresh, DbError> {
             c.execute("UPDATE notes SET read=1", &[])?;
             c.execute(
                 "INSERT INTO origins VALUES(?)",
                 &[day_persistence::Value::Text(format!("{origin:?}"))],
             )?;
-            Ok(())
-        }
-        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
-            true
+            Ok(Refresh::All)
         }
     }
     fn factory() -> Result<ModelContainer, DbError> {
@@ -1326,7 +1330,9 @@ fn participant_refreshes_direct_save_autosave_and_nonlocal_worker_origins() {
 
 #[test]
 fn direct_save_refresh_failure_does_not_rejournal_the_already_committed_edit() {
-    use day_persistence::{SqliteConnection, TransactionParticipant, WriteOrigin};
+    use day_persistence::{
+        Refresh, RowChange, SqliteConnection, TransactionParticipant, WriteOrigin,
+    };
     struct CountCommits(Arc<std::sync::atomic::AtomicU8>);
     impl TransactionParticipant for CountCommits {
         fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
@@ -1336,13 +1342,11 @@ fn direct_save_refresh_failure_does_not_rejournal_the_already_committed_edit() {
             &self,
             c: &mut dyn SqliteConnection,
             _: WriteOrigin,
-        ) -> Result<(), DbError> {
+            _: &[RowChange],
+        ) -> Result<Refresh, DbError> {
             c.execute("INSERT INTO committed_once VALUES(1)", &[])?;
             self.0.store(3, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        fn refresh_after_commit(&self, _: WriteOrigin) -> bool {
-            true
+            Ok(Refresh::All)
         }
     }
     day_reactive::Scope::detached().enter(|| {
@@ -1377,4 +1381,294 @@ fn direct_save_refresh_failure_does_not_rejournal_the_already_committed_edit() {
         .unwrap();
         assert_eq!(db.table_count::<Note>().unwrap(), 1);
     });
+}
+
+/// A participant that keeps every change set `before_commit` received, and fails the
+/// transaction after recording when asked to.
+struct ChangeLog {
+    sets: Arc<std::sync::Mutex<Vec<Vec<day_persistence::RowChange>>>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+impl day_persistence::TransactionParticipant for ChangeLog {
+    fn begin(
+        &self,
+        _: &mut dyn day_persistence::SqliteConnection,
+        _: day_persistence::WriteOrigin,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+    fn before_commit(
+        &self,
+        _: &mut dyn day_persistence::SqliteConnection,
+        _: day_persistence::WriteOrigin,
+        changes: &[day_persistence::RowChange],
+    ) -> Result<day_persistence::Refresh, DbError> {
+        self.sets.lock().unwrap().push(changes.to_vec());
+        if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(DbError::driver("synthetic participant failure"));
+        }
+        Ok(day_persistence::Refresh::None)
+    }
+}
+type ChangeSets = Arc<std::sync::Mutex<Vec<Vec<day_persistence::RowChange>>>>;
+fn change_log_worker() -> (
+    DatabaseWorker,
+    ChangeSets,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let sets: ChangeSets = Arc::default();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (log, flag) = (sets.clone(), fail.clone());
+    let w = block_on(DatabaseWorker::open(move || {
+        let db = ModelContainer::open(Sqlite::memory(), schema![Note])?;
+        db.install_transaction_participant(ChangeLog {
+            sets: log,
+            fail: flag,
+        })?;
+        Ok(db)
+    }))
+    .unwrap();
+    (w, sets, fail)
+}
+fn row_change(
+    key: u64,
+    kind: day_persistence::RowChangeKind,
+    authors: &[&'static str],
+) -> day_persistence::RowChange {
+    day_persistence::RowChange {
+        table: "notes",
+        key: vec![day_persistence::Value::Int(key as i64)],
+        kind,
+        authors: authors.to_vec(),
+    }
+}
+
+#[test]
+fn participant_receives_the_folded_change_set_with_kinds_columns_and_authors() {
+    use day_persistence::RowChangeKind::{Deleted, Inserted, Rewritten, Updated};
+    let (w, sets, _) = change_log_worker();
+    block_on(w.enable_undo(10)).unwrap();
+    block_on(w.write(|db| {
+        db.insert(note(1));
+        db.insert(note(2));
+        Ok(())
+    }))
+    .unwrap();
+    block_on(w.write(|db| {
+        day_model::with_author("importer", || {
+            db.get::<Note>(1u64)
+                .unwrap()
+                .title()
+                .write("renamed".into());
+        });
+        db.get::<Note>(1u64).unwrap().read().write(true);
+        db.delete::<Note>(2u64)
+    }))
+    .unwrap();
+    assert!(block_on(w.undo(false)).unwrap());
+    block_on(w.write(|db| {
+        day_model::with_author("catalog", || {
+            db.cache::<Note>().update("replace", |k| {
+                *k = day_model::Keyed::new(vec![note(7), note(8)]);
+            });
+        });
+        Ok(())
+    }))
+    .unwrap();
+    let sets = sets.lock().unwrap();
+    assert_eq!(sets.len(), 4);
+    assert_eq!(
+        sets[0],
+        vec![row_change(1, Inserted, &[]), row_change(2, Inserted, &[])]
+    );
+    assert_eq!(
+        sets[1],
+        vec![
+            row_change(1, Updated(vec!["title", "read"]), &["importer"]),
+            row_change(2, Deleted, &[]),
+        ]
+    );
+    // The undo replays the second transaction backwards, stamped as the undo author. The
+    // importer's title write is a background author's and never entered the history, so
+    // only the user's own `read` write and the delete come back.
+    let mut undone = sets[2].clone();
+    undone.sort_by_key(|c| {
+        c.key
+            .clone()
+            .into_iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        undone,
+        vec![
+            row_change(1, Updated(vec!["read"]), &["undo"]),
+            row_change(2, Inserted, &["undo"]),
+        ]
+    );
+    // A wholesale rewrite resyncs what the cache holds, every row written whole.
+    let mut rewritten = sets[3].clone();
+    rewritten.sort_by(|a, b| format!("{:?}", a.key).cmp(&format!("{:?}", b.key)));
+    assert_eq!(
+        rewritten,
+        vec![
+            row_change(7, Rewritten, &["catalog"]),
+            row_change(8, Rewritten, &["catalog"]),
+        ]
+    );
+    block_on(w.close()).unwrap();
+}
+
+#[test]
+fn participant_change_set_accumulates_across_intermediate_saves_and_clears_on_rollback() {
+    use day_persistence::RowChangeKind::{Inserted, Updated};
+    let (w, sets, fail) = change_log_worker();
+    block_on(w.write(|db| {
+        db.insert(note(1));
+        db.save()?;
+        db.get::<Note>(1u64).unwrap().read().write(true);
+        db.save()?;
+        db.insert(note(2));
+        Ok(())
+    }))
+    .unwrap();
+    // A job that fails after an intermediate save never reaches before_commit; its rows roll
+    // back with the transaction and must not leak into the next set.
+    assert!(
+        block_on(w.write::<()>(|db| {
+            db.insert(note(3));
+            db.save()?;
+            db.get::<Note>(1u64).unwrap().title().write("lost".into());
+            Err(DbError::driver("synthetic rejection"))
+        }))
+        .is_err()
+    );
+    block_on(w.write(|db| {
+        db.insert(note(4));
+        Ok(())
+    }))
+    .unwrap();
+    // A participant refusal is a rollback too: the refused set is gone, the next one clean.
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        block_on(w.write(|db| {
+            db.get::<Note>(4u64).unwrap().read().write(true);
+            Ok(())
+        }))
+        .is_err()
+    );
+    block_on(w.write(|db| {
+        db.insert(note(5));
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(count(&w), 4);
+    let sets = sets.lock().unwrap();
+    assert_eq!(
+        *sets,
+        vec![
+            vec![row_change(1, Inserted, &[]), row_change(2, Inserted, &[])],
+            vec![row_change(4, Inserted, &[])],
+            vec![row_change(4, Updated(vec!["read"]), &[])],
+            vec![row_change(5, Inserted, &[])],
+        ]
+    );
+    block_on(w.close()).unwrap();
+}
+
+#[derive(Model, Clone, Default, PartialEq, Debug)]
+#[model(table = "tags")]
+struct Tag {
+    #[model(id)]
+    id: u64,
+    label: String,
+    uses: i64,
+}
+
+#[test]
+fn table_scoped_refresh_rereads_only_the_named_table() {
+    use day_persistence::{
+        Refresh, RowChange, SqliteConnection, TransactionParticipant, WriteOrigin,
+    };
+    use std::{cell::RefCell, rc::Rc};
+    struct Projector(Arc<std::sync::atomic::AtomicBool>);
+    impl TransactionParticipant for Projector {
+        fn begin(&self, _: &mut dyn SqliteConnection, _: WriteOrigin) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn before_commit(
+            &self,
+            c: &mut dyn SqliteConnection,
+            _: WriteOrigin,
+            _: &[RowChange],
+        ) -> Result<Refresh, DbError> {
+            c.execute("UPDATE notes SET read = 1", &[])?;
+            c.execute("UPDATE tags SET uses = uses + 1", &[])?;
+            Ok(if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Refresh::All
+            } else {
+                Refresh::Tables(vec!["notes"])
+            })
+        }
+    }
+    let scope = day_reactive::Scope::detached();
+    scope.enter(|| {
+        let trace: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = trace.clone();
+        let driver = Sqlite::memory().trace_sql(move |sql| sink.borrow_mut().push(sql.to_string()));
+        let everything = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = ModelContainer::open(driver, schema![Note, Tag]).unwrap();
+        db.set_autosave(false);
+        db.install_transaction_participant(Projector(everything.clone()))
+            .unwrap();
+        db.insert(note(1));
+        db.insert(Tag {
+            id: 1,
+            label: "fresh".into(),
+            uses: 0,
+        });
+        db.save().unwrap();
+        // The notes row the participant rewrote was re-read; the tags row was not.
+        assert!(db.get::<Note>(1u64).unwrap().read().read());
+        assert_eq!(db.get::<Tag>(1u64).unwrap().uses().read(), 0);
+        let tags = db.query::<Tag>().live();
+        let notes = db.query::<Note>().live();
+        assert_eq!((tags.ids().len(), notes.ids().len()), (1, 1));
+        trace.borrow_mut().clear();
+        db.get::<Note>(1u64).unwrap().title().write("edited".into());
+        db.save().unwrap();
+        let touched_tags: Vec<String> = trace
+            .borrow()
+            .iter()
+            .filter(|s| s.starts_with("SELECT") && s.contains("\"tags\""))
+            .cloned()
+            .collect();
+        assert!(touched_tags.is_empty(), "{touched_tags:?}");
+        assert!(
+            trace
+                .borrow()
+                .iter()
+                .any(|s| s.starts_with("SELECT") && s.contains("\"notes\"")),
+            "{:?}",
+            trace.borrow()
+        );
+        assert_eq!(db.get::<Tag>(1u64).unwrap().uses().read(), 0);
+        // Refresh::All brings the tags row (two participant increments so far, plus this
+        // commit's) and its query up to date.
+        everything.store(true, std::sync::atomic::Ordering::SeqCst);
+        trace.borrow_mut().clear();
+        db.get::<Note>(1u64).unwrap().read().write(false);
+        db.save().unwrap();
+        assert_eq!(db.get::<Tag>(1u64).unwrap().uses().read(), 3);
+        assert!(
+            trace
+                .borrow()
+                .iter()
+                .any(|s| s.starts_with("SELECT") && s.contains("\"tags\"")),
+            "{:?}",
+            trace.borrow()
+        );
+        assert_eq!((tags.ids().len(), notes.ids().len()), (1, 1));
+    });
+    scope.dispose();
 }

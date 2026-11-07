@@ -355,11 +355,31 @@ SQLite tool; the bookkeeping is one `_day_schema` table (`table_name`, `fingerpr
 `version`), and every other table in the file is left alone, so an app can point the container
 at a database that also holds its own hand-made tables, and the two coexist.
 
-Each model's declared schema (table, columns, types, flags, indexes) hashes to a fingerprint.
-Equal fingerprints open instantly. A difference runs **lightweight migration**: added columns
-are `ALTER TABLE … ADD COLUMN`ed and backfilled with the field's Rust default, dropped columns
-are dropped. What lightweight migration cannot close (a rename, a type or codec change) needs
-a **staged migration**:
+Each model's declared schema (table, columns, types, flags, indexes) hashes to a fingerprint,
+together with a version of the DDL generation it vouches for, so a fingerprint an older build
+recorded stops matching when what the file must look like changes, and that file gets one
+comparison pass. Equal fingerprints open instantly. A difference compares the file's table (`PRAGMA table_info`,
+`foreign_key_list`, `index_list`) with the declaration, column by column and index by index:
+types, nullability, the primary key, uniqueness, foreign keys and their delete actions, and
+Day's own indexes. Added and dropped columns and indexes close through **lightweight
+migration**: an added column is `ALTER TABLE … ADD COLUMN`ed with its declared constraints
+(`NOT NULL DEFAULT <the field's Rust default as an SQL literal>`; a nullable relation column
+with its `REFERENCES`), and a declared `unique` column gets a `day_uidx_{table}_{column}`
+unique index, since `ADD COLUMN` cannot carry `UNIQUE` (a fresh table keeps the constraint
+inline; the two are equivalent to the comparison). Every other difference is a **table
+rebuild** following [SQLite's documented procedure](https://www.sqlite.org/lang_altertable.html#otheralter):
+the declared table is created beside the old one, the rows copied across (a required column
+that was nullable fills its `NULL`s from the Rust default; a missing one takes that default),
+the old table dropped, the new one renamed into place, Day's indexes and triggers and the
+application's surviving indexes re-created, and `PRAGMA foreign_key_check` run before the
+commit; foreign-key enforcement is off around that transaction and restored after it.
+Application-owned triggers on a rebuilt table are re-created verbatim after the rename; one
+that names a dropped column cannot come back, and its owner re-creates it after open. The
+rename itself runs as a legacy rename, so triggers and views on other tables that name the
+rebuilt table keep their references as written. A change the rebuild cannot make truthfully (the key column's type, a required column
+whose default stores `NULL`) is refused with a `Schema` error naming table and column, before
+anything is touched. The fingerprint is written last, so it only ever records a layout that
+has been brought to the declaration. A rename still needs a **staged migration**:
 
 ```rust
 let plan = MigrationPlan::new()
@@ -369,11 +389,14 @@ let plan = MigrationPlan::new()
 let container = ModelContainer::open_with(Sqlite::app_data("trips.db")?, schema![Trip], plan)?;
 ```
 
-Stages run in ascending order from the file's version, each in its own transaction; versions
-only go up, a gap is an error at open, and a file newer than the build refuses to open, because
-an old app writing a new schema would corrupt the data. Lightweight migration runs after the
-stages, so a
-stage handles the rename and the fingerprint closes the rest.
+Stages run in ascending order from the file's version, each in its own transaction together
+with the version row it leads to: a stage's effects and its label commit together or roll back
+together, so a failure in the stage, in the version write or in the commit leaves the old state
+at the old version, and the next launch reruns the stage from there (stages need not be
+idempotent). Versions only go up, a gap is an error at open, and a file newer than the build
+refuses to open, because an old app writing a new schema would corrupt the data. The schema
+comparison runs after the stages, so a stage handles the rename and the fingerprint closes the
+rest.
 
 When a stored row will not decode, the read is lenient in exactly one case: `NULL` in any
 column reads as the field's `Default` (this makes an added column's old rows readable before
@@ -589,8 +612,13 @@ there is no hash-to-integer conversion. The mapping makes index maintenance use 
 lookups and survives VACUUM. This costs an additional copy of indexed text. `day_key` is
 reserved among indexed columns on these models. R*Tree still requires an integer model key.
 
-The FTS and R*Tree shadows are each kept true by three `AFTER INSERT/UPDATE/DELETE` triggers, inside the same transaction as
-every write, and correct even for rows another tool writes into the file. (This is also why the
+The FTS and R*Tree shadows are each kept true by three `AFTER INSERT/UPDATE/DELETE` triggers,
+inside the same transaction as every write, and correct even for rows another tool writes into
+the file. The update triggers are `AFTER UPDATE OF <key, indexed columns>` with a `WHEN` that
+compares old and new values, so an update to other columns (a read flag, a star) or one that
+assigns an indexed column its own value does no index maintenance at all, on both the
+integer-key and the wide-key shape. Generated triggers are reconciled on every open against
+the text the engine stored: one whose logic changed is replaced, one that matches costs a read. (This is also why the
 fold's upsert is a true `ON CONFLICT DO UPDATE` and not `INSERT OR REPLACE`: the latter's
 implicit delete skips the delete triggers unless `recursive_triggers` is on, and the index
 would rot.) A freshly created shadow backfills from existing rows. FTS declaration or tokenizer changes
@@ -660,10 +688,13 @@ open.
 
 `backup_to(path)` is `VACUUM INTO`: a transactionally consistent, already-compacted snapshot
 taken while the app keeps writing, after flushing what is pending; there is no restore verb,
-because restoring is opening the copy. `integrity_check()` parses the PRAGMA into findings
-(empty means sound).
-`checkpoint()` folds the WAL into the main file; run it before the OS copies the file whole
-(device backup). `vacuum()` compacts in place; `size_bytes()` answers the settings-page
+because restoring is opening the copy. `integrity_check()` parses `PRAGMA integrity_check` and
+`PRAGMA foreign_key_check` into findings (empty means sound); `foreign_key_check()` is the
+structured form, one `ForeignKeyViolation` (child table, rowid, parent) per dangling reference.
+`checkpoint()` folds the WAL into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`) and answers
+with the engine's `Checkpoint` result: `busy`, `log_frames`, `checkpointed_frames` (both `0`
+after a completed truncation, the log it could not empty when busy, `-1` outside WAL mode); run
+it before the OS copies the file whole (device backup). `vacuum()` compacts in place; `size_bytes()` answers the settings-page
 question.
 
 ## Relations
@@ -996,6 +1027,30 @@ transaction. A callback error rolls back the transaction. A `DatabaseWorker::wri
 job invokes the participant once around the whole job, including intermediate saves and reactive
 follow-on edits. `write` uses `Local`; direct container saves also use `Local`.
 
+```rust
+pub trait TransactionParticipant: 'static {
+    fn begin(&self, connection: &mut dyn SqliteConnection, origin: WriteOrigin)
+        -> Result<(), DbError>;
+    fn before_commit(&self, connection: &mut dyn SqliteConnection, origin: WriteOrigin,
+        changes: &[RowChange]) -> Result<Refresh, DbError>;
+}
+```
+
+`before_commit` receives the transaction's folded change set: one `RowChange` per row the
+ORM's pipeline wrote, with its `table`, its `key` as stored (one value, or the parent/child
+pair of a join row), its `kind`, and the distinct `authors` (`day_model::with_author` tags, in
+first-seen order; the user's untagged edits add nothing) of the changes folded into it. The
+kinds are `Inserted`, `Updated(columns)` (the changed columns' names, transient fields left
+out), `Deleted` (the key only; the removed values are not retained) and `Rewritten` (every
+column written: a row-level replacement, or a row of a store rewritten wholesale by
+`Store::update`, which resyncs the resident rows). The set accumulates across every flush of
+one transaction, a worker job's intermediate saves included, and same-row entries coalesce
+the way the autosave fold does: an insert absorbs later updates, a delete absorbs what came
+before it, updates union their columns, a wholesale write supersedes a column list. A rollback
+clears the set. It covers relation upkeep and in-process cascades; rows the engine's own
+`ON DELETE` clause removed without the process faulting them are not in it, so a participant
+that needs complete capture of raw SQL keeps guard triggers for that path.
+
 Callbacks must persist their state in that SQL transaction and must not reenter the container,
 mutate reactive models, commit, roll back, or perform network I/O. A failed callback may be retried;
 process-local counters are not durable journal state. Installing another participant, installing
@@ -1006,13 +1061,19 @@ There is deliberately one participant per container. A caller needing several ex
 install one composite participant with explicit callback ordering and shared rollback semantics.
 The origin is a trusted caller declaration, not an authorization boundary.
 
-A participant can request `refresh_after_commit` when its SQL changes resident model rows.
-This applies to direct saves/autosave and worker transactions. A failed refresh returns
+`before_commit` answers with the cache refresh its own SQL calls for, run after the COMMIT
+succeeds and before the work is acknowledged: `Refresh::None` when it wrote nothing the caches
+hold; `Refresh::Tables(names)` to re-read and diff only those tables' resident rows, drop the
+relation memos with an end (or join table) among them, and re-run only the live queries that
+read them (a query over one of the tables, one crossing into one through a relation, or a raw
+query naming one); `Refresh::All` for every resident row, memo and query. This applies to
+direct saves/autosave and worker transactions. A failed refresh returns
 `DbErrorKind::CommittedRefreshFailed`: the data is durable, so do not retry the edit. Worker
 revision and undo/redo bookkeeping still advance (a committed replacement clears undo).
-Workers retry the cache refresh before subsequent database operations. Direct-container callers
-must `rescan()` successfully before making further edits; `last_error` also exposes autosave
-failures. Refreshing cannot roll back a committed transaction.
+Workers retry the cache refresh (as a full one) before subsequent database operations.
+Direct-container callers must `rescan()` successfully before making further edits;
+`last_error` also exposes autosave failures. Refreshing cannot roll back a committed
+transaction.
 
 Synchronization protocols and application-specific experiments are outside this crate's contract.
 Updating persistence does not enroll an application in synchronization.

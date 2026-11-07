@@ -352,6 +352,60 @@ pub struct Capabilities {
     pub unicode_fold: bool,
 }
 
+/// What `PRAGMA wal_checkpoint(TRUNCATE)` answered ([`ModelContainer::checkpoint`]): the
+/// three columns of its status row. The engine reads the counts after the checkpoint, so a
+/// completed one answers `0` and `0` (the log was emptied); a busy one describes the log it
+/// had to leave behind. Both counts are `-1` when the database is not in WAL mode (a memory
+/// database, or `wal: false`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// A reader or writer kept the checkpoint from completing within the busy timeout; the
+    /// WAL was folded as far as it could be and the rest waits for the next call.
+    pub busy: bool,
+    /// Frames in the WAL when the checkpoint finished.
+    pub log_frames: i64,
+    /// Frames of that log already carried into the main file.
+    pub checkpointed_frames: i64,
+}
+
+impl Checkpoint {
+    /// The whole log was folded and truncated.
+    pub fn is_complete(&self) -> bool {
+        !self.busy
+    }
+}
+
+/// One row of `PRAGMA foreign_key_check` ([`ModelContainer::foreign_key_check`]): a child
+/// row whose reference names no parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyViolation {
+    /// The child table.
+    pub table: String,
+    /// The child row's rowid; `None` for a `WITHOUT ROWID` table.
+    pub rowid: Option<i64>,
+    /// The parent table the reference names.
+    pub parent: String,
+    /// The constraint's index in the child's `PRAGMA foreign_key_list`.
+    pub constraint: i64,
+}
+
+impl fmt::Display for ForeignKeyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rowid {
+            Some(rowid) => write!(
+                f,
+                "foreign key: {} row {rowid} references missing {}",
+                self.table, self.parent
+            ),
+            None => write!(
+                f,
+                "foreign key: {} row references missing {}",
+                self.table, self.parent
+            ),
+        }
+    }
+}
+
 /// The engine trait. Object-safe on the connection side, so the container stores
 /// `Box<dyn SqliteConnection>` and never names an engine type.
 pub trait SqliteDriver {
@@ -914,6 +968,11 @@ pub fn model_fingerprint<M: Model>() -> u64 {
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     };
+    // The DDL generation this fingerprint vouches for. Bumped when what the file must look
+    // like changes (constrained column additions, unique indexes), so a fingerprint an older
+    // build recorded no longer matches and the file gets one comparison pass, which rebuilds
+    // what the older path left unconstrained and records the new fingerprint.
+    eat(b"ddl-v2|");
     eat(M::TABLE.as_bytes());
     eat(M::KEY.as_bytes());
     for c in M::COLUMNS {
@@ -987,6 +1046,8 @@ struct FkSpec {
     parent_table: &'static str,
     /// `parent_table` as the `REFERENCES` clause names it.
     parent_sql: String,
+    /// `parent_table` as `PRAGMA foreign_key_list` reports it: the bare, unquoted name.
+    parent_bare: &'static str,
     parent_key: &'static str,
     rule: DeleteRule,
 }
@@ -1003,6 +1064,7 @@ impl Schema {
                     child_field: def.inverse,
                     parent_table: M::TABLE,
                     parent_sql: TableName::of::<M>().sql(),
+                    parent_bare: TableName::of::<M>().bare,
                     parent_key: M::KEY,
                     rule: def.delete,
                 });
@@ -1097,6 +1159,20 @@ struct DirtyState {
     /// upserting every resident row. With a lazy cache no "delete the rest" is possible (the
     /// rest was never loaded), so wholesale rewrites are a resync of the working set only.
     full: Vec<u64>,
+    /// (store, key) → the distinct author tags of the changes folded into that row, in
+    /// first-seen order; the unauthored user edit (`None`) leaves no tag.
+    authors: HashMap<(u64, u64), Vec<&'static str>>,
+    /// store → the author tags of its wholesale rewrites.
+    store_authors: HashMap<u64, Vec<&'static str>>,
+}
+
+/// Record one author tag once, in first-seen order; `None` (the user) is not a tag.
+fn add_author(tags: &mut Vec<&'static str>, author: Option<&'static str>) {
+    if let Some(author) = author
+        && !tags.contains(&author)
+    {
+        tags.push(author);
+    }
 }
 
 impl DirtyState {
@@ -1104,6 +1180,18 @@ impl DirtyState {
         for store in newer.full {
             if !self.full.contains(&store) {
                 self.full.push(store);
+            }
+        }
+        for (store, tags) in newer.store_authors {
+            let mine = self.store_authors.entry(store).or_default();
+            for tag in tags {
+                add_author(mine, Some(tag));
+            }
+        }
+        for (id, tags) in newer.authors {
+            let mine = self.authors.entry(id).or_default();
+            for tag in tags {
+                add_author(mine, Some(tag));
             }
         }
         for id in newer.order {
@@ -1143,6 +1231,7 @@ impl DirtyState {
             if !self.full.contains(&store) {
                 self.full.push(store);
             }
+            add_author(self.store_authors.entry(store).or_default(), change.author);
             return;
         };
         if key == day_model::STRUCTURE {
@@ -1152,6 +1241,7 @@ impl DirtyState {
         if !self.rows.contains_key(&id) {
             self.order.push(id);
         }
+        add_author(self.authors.entry(id).or_default(), change.author);
         let slot = self.rows.entry(id).or_insert(DirtyRow::Update(Vec::new()));
         match (change.op, &mut *slot) {
             (Op::Delete, _) => *slot = DirtyRow::Delete,
@@ -1185,6 +1275,8 @@ pub(crate) struct TableHooks {
     /// `WHERE` clause + params addressing one row by its key handle.
     pub(crate) key_where: KeyWhere,
     pub(crate) columns: Vec<String>,
+    /// `columns` again, as the model's static names: what a [`RowChange`] reports.
+    pub(crate) column_names: Vec<&'static str>,
     /// Same order as `columns`; what a change's label matches against.
     pub(crate) fields: Vec<String>,
     /// The FTS5 shadow's table name, when the model declares `fts(…)`.
@@ -1228,29 +1320,106 @@ pub enum WriteOrigin {
     Maintenance,
 }
 
+/// One row of a transaction's folded change set, as [`TransactionParticipant::before_commit`]
+/// receives it: every row the ORM's pipeline wrote in the transaction (model edits, relation
+/// upkeep, in-process cascades), one entry per (table, key). Rows the engine's own `ON
+/// DELETE` clause removed without the process faulting them are not in the set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowChange {
+    /// The model's table, as [`Model::TABLE`] names it (a join table by its generated name).
+    pub table: &'static str,
+    /// The key as stored: one value, or the (parent, child) pair of a join row.
+    pub key: Vec<Value>,
+    pub kind: RowChangeKind,
+    /// The distinct author tags ([`day_model::with_author`]) of the changes folded into
+    /// the row, first seen first. The user's own edits carry no tag; the container's
+    /// external-merge author never reaches the set.
+    pub authors: Vec<&'static str>,
+}
+
+/// What happened to a [`RowChange`]'s row over the transaction. Same-row changes coalesce
+/// the way the autosave fold does: an insert absorbs later updates, a delete absorbs
+/// everything before it, updates union their columns, and a wholesale write supersedes a
+/// column list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowChangeKind {
+    Inserted,
+    /// The changed columns' names, in first-touch order; transient fields never appear.
+    Updated(Vec<&'static str>),
+    /// The key only; the removed row's values are not retained.
+    Deleted,
+    /// Every column was written: a row-level replacement, or a row of a store rewritten
+    /// wholesale (`Store::update`), which resyncs the resident rows.
+    Rewritten,
+}
+
+impl RowChange {
+    /// Fold a later change to the same row into this one, by the autosave fold's rules.
+    fn absorb(&mut self, later: RowChange) {
+        for author in later.authors {
+            add_author(&mut self.authors, Some(author));
+        }
+        self.kind = match (
+            std::mem::replace(&mut self.kind, RowChangeKind::Deleted),
+            later.kind,
+        ) {
+            (RowChangeKind::Updated(mut cols), RowChangeKind::Updated(more)) => {
+                for col in more {
+                    if !cols.contains(&col) {
+                        cols.push(col);
+                    }
+                }
+                RowChangeKind::Updated(cols)
+            }
+            (RowChangeKind::Updated(_), RowChangeKind::Rewritten)
+            | (RowChangeKind::Rewritten, RowChangeKind::Updated(_) | RowChangeKind::Rewritten) => {
+                RowChangeKind::Rewritten
+            }
+            (
+                kept @ (RowChangeKind::Inserted | RowChangeKind::Deleted),
+                RowChangeKind::Updated(_) | RowChangeKind::Rewritten,
+            ) => kept,
+            (_, next @ (RowChangeKind::Inserted | RowChangeKind::Deleted)) => next,
+        };
+    }
+}
+
+/// The cache refresh a participant asks for after its own SQL may have changed model rows
+/// that were already flushed from the caches.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Refresh {
+    /// The participant wrote nothing the caches hold.
+    #[default]
+    None,
+    /// Re-read and diff the resident rows of these tables only, drop the relation memos
+    /// that involve them, and re-run the live queries that read them.
+    Tables(Vec<&'static str>),
+    /// Every resident row, every relation memo, every live query.
+    All,
+}
+
 /// Queue-confined extension participating in the SAME SQL transaction as model changes.
 /// Callbacks must use only the supplied connection, never re-enter the container, commit,
 /// roll back, perform network I/O, or mutate reactive models. Returning an error aborts the
 /// transaction. `before_commit` runs after worker reactions and intermediate saves settle.
 /// Persist extension state transactionally; callbacks may run again following a rollback.
 pub trait TransactionParticipant: 'static {
-    /// SQL projections made by a participant may change model rows after their caches were
-    /// flushed. Refresh resident models after a successful COMMIT, before acknowledging work.
-    /// A refresh failure is reported after commit (it cannot roll back durable data).
-    fn refresh_after_commit(&self, _origin: WriteOrigin) -> bool {
-        false
-    }
-
     fn begin(
         &self,
         connection: &mut dyn SqliteConnection,
         origin: WriteOrigin,
     ) -> Result<(), DbError>;
+    /// The transaction's folded change set is `changes`: accumulated across every flush in
+    /// the transaction (a worker job's intermediate saves included), empty again after a
+    /// rollback. The answer names the cache refresh to run after a successful COMMIT, before
+    /// the work is acknowledged; a refresh failure surfaces as
+    /// [`DbErrorKind::CommittedRefreshFailed`] (the data is durable, it cannot roll back).
     fn before_commit(
         &self,
         connection: &mut dyn SqliteConnection,
         origin: WriteOrigin,
-    ) -> Result<(), DbError>;
+        changes: &[RowChange],
+    ) -> Result<Refresh, DbError>;
 }
 
 pub(crate) struct ContainerInner {
@@ -1283,6 +1452,11 @@ pub(crate) struct ContainerInner {
     /// An outer worker transaction owns commit/rollback; inner model saves only execute SQL.
     worker_transaction: Cell<bool>,
     participant: RefCell<Option<Rc<dyn TransactionParticipant>>>,
+    /// The open transaction's folded change set, kept only while a participant is installed:
+    /// appended per flush, handed to `before_commit`, cleared at begin, commit and rollback.
+    transaction_changes: RefCell<Vec<RowChange>>,
+    /// What `before_commit` asked for, acted on once the COMMIT has succeeded.
+    refresh_scope: RefCell<Refresh>,
     refresh_pending: Cell<bool>,
     /// Soft per-table bound on resident rows. Dirty and observed rows never evict, so the
     /// working set can exceed it; everything else does not.
@@ -1347,6 +1521,8 @@ impl ModelContainer {
                 worker_transaction: Cell::new(false),
                 refresh_pending: Cell::new(false),
                 participant: RefCell::new(None),
+                transaction_changes: RefCell::new(Vec::new()),
+                refresh_scope: RefCell::new(Refresh::None),
                 cache_limit: Cell::new(DEFAULT_CACHE_LIMIT),
                 eviction_retry: RefCell::new(HashMap::new()),
                 error,
@@ -1450,21 +1626,53 @@ impl ModelContainer {
         conn: &mut dyn SqliteConnection,
         origin: WriteOrigin,
     ) -> Result<(), DbError> {
-        if let Some(p) = self.inner.participant.borrow().as_ref() {
+        let participant = self.inner.participant.borrow().clone();
+        if let Some(p) = participant {
+            self.inner.transaction_changes.borrow_mut().clear();
+            *self.inner.refresh_scope.borrow_mut() = Refresh::None;
             p.begin(conn, origin)?;
         }
         Ok(())
     }
 
+    /// Hand the participant the transaction's change set and keep its refresh request for
+    /// [`ModelContainer::participant_refresh`], which runs once the COMMIT has succeeded.
     fn participant_commit(
         &self,
         conn: &mut dyn SqliteConnection,
         origin: WriteOrigin,
     ) -> Result<(), DbError> {
-        if let Some(p) = self.inner.participant.borrow().as_ref() {
-            p.before_commit(conn, origin)?;
+        let participant = self.inner.participant.borrow().clone();
+        if let Some(p) = participant {
+            let changes = std::mem::take(&mut *self.inner.transaction_changes.borrow_mut());
+            let scope = p.before_commit(conn, origin, &changes)?;
+            *self.inner.refresh_scope.borrow_mut() = scope;
         }
         Ok(())
+    }
+
+    /// A transaction is ending without a COMMIT: its change set is not anyone's to see.
+    fn participant_rollback(&self) {
+        self.inner.transaction_changes.borrow_mut().clear();
+        *self.inner.refresh_scope.borrow_mut() = Refresh::None;
+    }
+
+    /// Append one flush's folded rows to the open transaction's change set, coalescing with
+    /// the rows earlier flushes of the same transaction already recorded.
+    fn record_changes(&self, changes: Vec<RowChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut set = self.inner.transaction_changes.borrow_mut();
+        for change in changes {
+            match set
+                .iter_mut()
+                .find(|c| c.table == change.table && c.key == change.key)
+            {
+                None => set.push(change),
+                Some(prior) => prior.absorb(change),
+            }
+        }
     }
 
     /// The last autosave failure, if any, as a tracked signal the UI can watch.
@@ -1531,39 +1739,53 @@ impl ModelContainer {
             }
         }
         if result.is_ok() && !self.inner.worker_transaction.get() && had_writes {
-            self.participant_refresh(WriteOrigin::Local)?;
+            self.participant_refresh()?;
         }
         result
     }
 
-    fn participant_refresh(&self, origin: WriteOrigin) -> Result<(), DbError> {
-        let refresh = self
-            .inner
-            .participant
-            .borrow()
-            .as_ref()
-            .is_some_and(|p| p.refresh_after_commit(origin));
-        if refresh {
-            self.inner.refresh_pending.set(true);
-            self.refresh_committed().map_err(|e| {
-                let error = DbError::new(DbErrorKind::CommittedRefreshFailed, e.to_string());
-                self.inner.error.set(Some(error.to_string()));
-                error
-            })?;
-        }
-        Ok(())
+    /// After a successful COMMIT: the refresh `before_commit` asked for. A failure here is
+    /// [`DbErrorKind::CommittedRefreshFailed`]; the refresh stays pending (as a full one) for
+    /// the next save to retry, since the file already holds the participant's writes.
+    fn participant_refresh(&self) -> Result<(), DbError> {
+        let scope = std::mem::take(&mut *self.inner.refresh_scope.borrow_mut());
+        let tables = match scope {
+            Refresh::None => return Ok(()),
+            Refresh::Tables(tables) => Some(tables),
+            Refresh::All => None,
+        };
+        self.inner.refresh_pending.set(true);
+        self.refresh_committed_in(tables.as_deref()).map_err(|e| {
+            let error = DbError::new(DbErrorKind::CommittedRefreshFailed, e.to_string());
+            self.inner.error.set(Some(error.to_string()));
+            error
+        })
     }
 
     fn refresh_committed(&self) -> Result<(), DbError> {
+        self.refresh_committed_in(None)
+    }
+
+    /// Re-read the resident rows of `tables` (every table when `None`) and bring the memos
+    /// and live queries that depend on them up to date.
+    fn refresh_committed_in(&self, tables: Option<&[&'static str]>) -> Result<(), DbError> {
         if !self.inner.dirty.borrow().is_empty() {
             return Err(DbError::new(
                 DbErrorKind::Deny,
                 "refresh committed state before making further model edits",
             ));
         }
-        self.refresh_resident()?;
-        self.invalidate_relation_memos();
-        self.requery_all();
+        self.refresh_resident_in(tables)?;
+        match tables {
+            None => {
+                self.invalidate_relation_memos();
+                self.requery_all();
+            }
+            Some(tables) => {
+                self.invalidate_relation_memos_of(tables);
+                self.requery_tables(tables);
+            }
+        }
         if self.inner.caps.external_changes {
             self.inner.data_version.set(self.file_data_version()?);
         }
@@ -1877,13 +2099,34 @@ impl ModelContainer {
         Ok(version)
     }
 
-    fn set_db_version(&self, v: u32) -> Result<(), DbError> {
-        self.conn().execute(
+    /// The `_db` version row, written on the caller's connection so it can ride inside the
+    /// transaction whose effects it labels.
+    fn write_db_version(conn: &mut dyn SqliteConnection, v: u32) -> Result<(), DbError> {
+        conn.execute(
             "INSERT INTO _day_schema (table_name, fingerprint, version) VALUES ('_db', '', ?) \
              ON CONFLICT(table_name) DO UPDATE SET version = excluded.version",
             &[Value::Int(v as i64)],
         )?;
         Ok(())
+    }
+
+    /// `f` and the version row it leads to, in one transaction: the stage's effects and its
+    /// label commit together or not at all. A failure in the stage, in the version write, or
+    /// in the commit itself takes the one rollback path.
+    fn versioned_transaction(
+        &self,
+        version: u32,
+        f: impl FnOnce(&mut dyn SqliteConnection) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let mut conn = self.conn();
+        conn.begin()?;
+        let result = f(conn.as_mut())
+            .and_then(|()| Self::write_db_version(conn.as_mut(), version))
+            .and_then(|()| conn.commit());
+        if result.is_err() {
+            let _ = conn.rollback();
+        }
+        result
     }
 
     fn run_stages(&self, plan: MigrationPlan) -> Result<(), DbError> {
@@ -1913,23 +2156,11 @@ impl ModelContainer {
                     ),
                 ));
             }
-            let mut conn = self.conn();
-            conn.begin()?;
-            match (stage.run)(conn.as_mut()) {
-                Ok(()) => {
-                    conn.commit()?;
-                    drop(conn);
-                    current = stage.to;
-                    self.set_db_version(current)?;
-                }
-                Err(e) => {
-                    let _ = conn.rollback();
-                    return Err(e);
-                }
-            }
+            self.versioned_transaction(stage.to, stage.run)?;
+            current = stage.to;
         }
-        if target > 0 {
-            self.set_db_version(target)?;
+        if target > 0 && current != target {
+            self.versioned_transaction(target, |_| Ok(()))?;
         }
         Ok(())
     }
@@ -2079,6 +2310,7 @@ impl ModelContainer {
                 key_cols: vec![M::KEY.to_string()],
                 key_where: Rc::new(|h| (format!("{} = ?", ident(M::KEY)), vec![key_param(h)])),
                 columns,
+                column_names: M::COLUMNS.iter().map(|c| c.name).collect(),
                 fields,
                 resident_len,
                 fts: (!M::FTS_COLUMNS.is_empty()).then(|| format!("{}_fts", M::TABLE)),
@@ -2116,8 +2348,8 @@ impl ModelContainer {
     fn ensure_table<M: Model>(&self) -> Result<(), DbError> {
         // Relation-contributed clauses fold into the fingerprint: adopting or changing a
         // delete rule re-runs this path. An existing table cannot gain the SQL-level clause
-        // (SQLite has no `ALTER ADD CONSTRAINT`); the in-memory rule still enforces, and a
-        // staged rebuild adopts the clause when the app wants the engine's backstop too.
+        // in place (SQLite has no `ALTER ADD CONSTRAINT`), so the comparison below routes
+        // that difference through the table rebuild, which writes the declared DDL whole.
         let mut fp_val = model_fingerprint::<M>();
         for s in self
             .inner
@@ -2139,46 +2371,120 @@ impl ModelContainer {
         let fp = format!("{fp_val:016x}");
         let stored = self.stored_fingerprint(M::TABLE)?;
         if stored.as_deref() == Some(fp.as_str()) {
-            return Ok(());
+            // The layout is known to match; the generated triggers are still reconciled, so
+            // updated trigger logic reaches an existing file (an unchanged trigger is a read
+            // and no write).
+            self.conn().begin()?;
+            let result = self
+                .create_shadow_tables::<M>()
+                .and_then(|()| self.conn().commit());
+            if result.is_err() {
+                let _ = self.conn().rollback();
+            }
+            return result;
         }
 
-        // DDL and backfill are one transaction: a failed migration leaves the old
-        // index and fingerprint usable. Remove triggers before dropping indexed columns.
-        self.conn().begin()?;
-        let result = (|| {
-            let name = TableName::of::<M>();
-            let t = name.bare;
-            if self.table_exists(&format!("{t}_fts"))? {
-                for suffix in ["ai", "ad", "au"] {
+        let name = TableName::of::<M>();
+        // A missing table is created whole; an existing one is compared column by column,
+        // index by index, and the comparison decides between in-place DDL and a rebuild,
+        // or refuses before anything is touched.
+        let delta = if self.table_exists(M::TABLE)? {
+            let file = self.file_schema(name)?;
+            Some((self.compare_schema::<M>(&file)?, file))
+        } else {
+            None
+        };
+        // A rebuild drops and recreates the table, which `PRAGMA foreign_keys` would treat
+        // as a delete of every row (cascading into children). The pragma is a no-op inside
+        // a transaction, so it toggles around one, and the rebuild's own
+        // `foreign_key_check` is what guarantees nothing dangles afterwards.
+        let rebuild = matches!(delta, Some((SchemaDelta::Rebuild, _)));
+        let fk_was_on = rebuild && self.foreign_keys_enabled()?;
+        if fk_was_on {
+            self.conn().execute("PRAGMA foreign_keys = OFF", &[])?;
+        }
+
+        // DDL, copy and backfill are one transaction: a failed migration leaves the old
+        // table, index and fingerprint usable. Remove triggers before dropping indexed
+        // columns.
+        // Bound first: the `RefMut` the `begin` call holds must be gone before the closure
+        // borrows the connection again.
+        let began = self.conn().begin();
+        let result = began.and_then(|()| {
+            let result = (|| {
+                let t = name.bare;
+                if self.table_exists(&format!("{t}_fts"))? {
+                    for suffix in ["ai", "ad", "au"] {
+                        self.conn().execute(
+                            &format!(
+                                "DROP TRIGGER IF EXISTS {}",
+                                ident(&format!("{t}_fts_{suffix}"))
+                            ),
+                            &[],
+                        )?;
+                    }
+                    self.conn()
+                        .execute(&format!("DROP TABLE {}", name.shadow("_fts")), &[])?;
                     self.conn().execute(
-                        &format!(
-                            "DROP TRIGGER IF EXISTS {}",
-                            ident(&format!("{t}_fts_{suffix}"))
-                        ),
+                        &format!("DROP TABLE IF EXISTS {}", name.shadow("_fts_keys")),
                         &[],
                     )?;
                 }
-                self.conn()
-                    .execute(&format!("DROP TABLE {}", name.shadow("_fts")), &[])?;
-                self.conn().execute(
-                    &format!("DROP TABLE IF EXISTS {}", name.shadow("_fts_keys")),
-                    &[],
-                )?;
+                let mut unique_indexes: Vec<&'static str> = Vec::new();
+                match delta {
+                    None => self.create_table_named::<M>(name.sql())?,
+                    Some((SchemaDelta::Lightweight(plan), _)) => {
+                        unique_indexes = plan.unique_indexes.clone();
+                        self.lightweight_migrate::<M>(&plan)?;
+                    }
+                    Some((SchemaDelta::Rebuild, file)) => {
+                        self.rebuild_table::<M>(&file)?;
+                    }
+                }
+                self.create_indexes::<M>(&unique_indexes)?;
+                if rebuild {
+                    let dangling = Self::foreign_key_check_on(self.conn().as_mut())?;
+                    if let Some(first) = dangling.first() {
+                        return Err(DbError::new(
+                            DbErrorKind::Schema,
+                            format!(
+                                "rebuilding `{}` leaves {} row(s) with a dangling foreign \
+                                 key ({first}); the file is unchanged",
+                                M::TABLE,
+                                dangling.len()
+                            ),
+                        ));
+                    }
+                }
+                self.create_shadow_tables::<M>()?;
+                // The fingerprint is the last write: it records a layout that has been
+                // brought to the declaration and verified, never one still in flight.
+                self.store_fingerprint(M::TABLE, &fp)?;
+                self.conn().commit()
+            })();
+            if result.is_err() {
+                let _ = self.conn().rollback();
             }
-            if !self.table_exists(M::TABLE)? {
-                self.create_table::<M>()?;
-            } else {
-                self.lightweight_migrate::<M>()?;
-            }
-            self.create_indexes::<M>()?;
-            self.create_shadow_tables::<M>()?;
-            self.store_fingerprint(M::TABLE, &fp)?;
-            self.conn().commit()
-        })();
-        if result.is_err() {
-            let _ = self.conn().rollback();
+            result
+        });
+        if fk_was_on {
+            let restored = self
+                .conn()
+                .execute("PRAGMA foreign_keys = ON", &[])
+                .map(|_| ());
+            return result.and(restored);
         }
         result
+    }
+
+    /// Whether this connection enforces foreign keys right now (`PRAGMA foreign_keys`). A
+    /// driver that answers nothing (the Recorder) counts as not enforcing.
+    fn foreign_keys_enabled(&self) -> Result<bool, DbError> {
+        let mut on = false;
+        self.conn().query("PRAGMA foreign_keys", &[], &mut |row| {
+            on = row.get(0).as_int().unwrap_or(0) != 0;
+        })?;
+        Ok(on)
     }
 
     /// The FTS5 and R*Tree shadows a model declares: virtual tables plus `AFTER` triggers, so
@@ -2242,17 +2548,28 @@ impl ModelContainer {
                 let delete = format!(
                     "DELETE FROM {fts} WHERE rowid = (SELECT day_rowid FROM {fts_keys} WHERE day_key = old.{key}); DELETE FROM {fts_keys} WHERE day_key = old.{key};"
                 );
+                let (update_of, changed) = fts_update_guard(M::KEY, M::FTS_COLUMNS);
                 for (suffix, event, body) in [
-                    ("_fts_ai", "INSERT", insert.clone()),
-                    ("_fts_ad", "DELETE", delete.clone()),
-                    ("_fts_au", "UPDATE", format!("{delete} {insert}")),
+                    ("_fts_ai", "INSERT".to_string(), insert.clone()),
+                    ("_fts_ad", "DELETE".to_string(), delete.clone()),
+                    (
+                        "_fts_au",
+                        format!("UPDATE OF {update_of}"),
+                        format!("{delete} {insert}"),
+                    ),
                 ] {
-                    self.conn().execute(
+                    let when = if suffix == "_fts_au" {
+                        format!(" WHEN {changed}")
+                    } else {
+                        String::new()
+                    };
+                    self.ensure_trigger(
+                        &format!("{bare}{suffix}"),
+                        name.schema,
                         &format!(
-                            "CREATE TRIGGER IF NOT EXISTS {} AFTER {event} ON {t} BEGIN {body} END",
+                            "CREATE TRIGGER {} AFTER {event} ON {t}{when} BEGIN {body} END",
                             trigger(suffix)
                         ),
-                        &[],
                     )?;
                 }
                 if fresh {
@@ -2276,30 +2593,37 @@ impl ModelContainer {
                     &[],
                 )?;
                 let old_cols = prefixed_list("old", M::FTS_COLUMNS);
-                self.conn().execute(
+                self.ensure_trigger(
+                    &format!("{bare}_fts_ai"),
+                    name.schema,
                     &format!(
-                        "CREATE TRIGGER IF NOT EXISTS {} AFTER INSERT ON {t} BEGIN \
+                        "CREATE TRIGGER {} AFTER INSERT ON {t} BEGIN \
                      INSERT INTO {fts}(rowid, {cols}) VALUES (new.{key}, {new_cols}); END",
                         trigger("_fts_ai")
                     ),
-                    &[],
                 )?;
-                self.conn().execute(
+                self.ensure_trigger(
+                    &format!("{bare}_fts_ad"),
+                    name.schema,
                     &format!(
-                        "CREATE TRIGGER IF NOT EXISTS {} AFTER DELETE ON {t} BEGIN \
+                        "CREATE TRIGGER {} AFTER DELETE ON {t} BEGIN \
                      INSERT INTO {fts}({fts_command}, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); END",
                         trigger("_fts_ad")
                     ),
-                    &[],
                 )?;
-                self.conn().execute(
+                // Only a change to indexed content or to the row's identity re-indexes it: an
+                // update that touches other columns, or assigns an indexed column its own
+                // value, leaves the index alone.
+                let (update_of, changed) = fts_update_guard(M::KEY, M::FTS_COLUMNS);
+                self.ensure_trigger(
+                    &format!("{bare}_fts_au"),
+                    name.schema,
                     &format!(
-                        "CREATE TRIGGER IF NOT EXISTS {} AFTER UPDATE ON {t} BEGIN \
+                        "CREATE TRIGGER {} AFTER UPDATE OF {update_of} ON {t} WHEN {changed} BEGIN \
                      INSERT INTO {fts}({fts_command}, rowid, {cols}) VALUES ('delete', old.{key}, {old_cols}); \
                      INSERT INTO {fts}(rowid, {cols}) VALUES (new.{key}, {new_cols}); END",
                         trigger("_fts_au")
                     ),
-                    &[],
                 )?;
                 if fresh {
                     // External-content rebuild: index whatever rows predate the declaration.
@@ -2330,29 +2654,32 @@ impl ModelContainer {
                 ),
                 &[],
             )?;
-            self.conn().execute(
+            self.ensure_trigger(
+                &format!("{bare}_geo_ai"),
+                name.schema,
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {} AFTER INSERT ON {t} BEGIN \
+                    "CREATE TRIGGER {} AFTER INSERT ON {t} BEGIN \
                      INSERT OR REPLACE INTO {geo} VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END",
                     trigger("_geo_ai")
                 ),
-                &[],
             )?;
-            self.conn().execute(
+            self.ensure_trigger(
+                &format!("{bare}_geo_au"),
+                name.schema,
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {} AFTER UPDATE OF {lat}, {lon} ON {t} BEGIN \
+                    "CREATE TRIGGER {} AFTER UPDATE OF {lat}, {lon} ON {t} BEGIN \
                      INSERT OR REPLACE INTO {geo} VALUES (new.{key}, new.{lat}, new.{lat}, new.{lon}, new.{lon}); END",
                     trigger("_geo_au")
                 ),
-                &[],
             )?;
-            self.conn().execute(
+            self.ensure_trigger(
+                &format!("{bare}_geo_ad"),
+                name.schema,
                 &format!(
-                    "CREATE TRIGGER IF NOT EXISTS {} AFTER DELETE ON {t} BEGIN \
+                    "CREATE TRIGGER {} AFTER DELETE ON {t} BEGIN \
                      DELETE FROM {geo} WHERE {key} = old.{key}; END",
                     trigger("_geo_ad")
                 ),
-                &[],
             )?;
             if fresh {
                 self.conn().execute(
@@ -2367,6 +2694,42 @@ impl ModelContainer {
         Ok(())
     }
 
+    /// Install a generated trigger, replacing one whose stored text differs: updated trigger
+    /// logic reaches an existing file on the open that carries it, and a trigger that is
+    /// already right costs one `sqlite_master` read and no write. `create_sql` is the plain
+    /// `CREATE TRIGGER` statement; the engine stores that text verbatim, which is what the
+    /// comparison reads back.
+    fn ensure_trigger(
+        &self,
+        bare_name: &str,
+        schema: Option<&str>,
+        create_sql: &str,
+    ) -> Result<(), DbError> {
+        let master = table_sql(schema, "sqlite_master");
+        let mut stored: Option<String> = None;
+        self.conn().query(
+            &format!("SELECT sql FROM {master} WHERE type = 'trigger' AND name = ?"),
+            &[Value::Text(bare_name.into())],
+            &mut |row| {
+                if let Ok(sql) = row.get(0).as_text() {
+                    stored = Some(sql.to_string());
+                }
+            },
+        )?;
+        match stored {
+            Some(sql) if sql == create_sql => return Ok(()),
+            Some(_) => {
+                self.conn().execute(
+                    &format!("DROP TRIGGER IF EXISTS {}", table_sql(schema, bare_name)),
+                    &[],
+                )?;
+            }
+            None => {}
+        }
+        self.conn().execute(create_sql, &[])?;
+        Ok(())
+    }
+
     fn table_exists(&self, table: &str) -> Result<bool, DbError> {
         let mut found = false;
         self.conn().query(
@@ -2377,18 +2740,23 @@ impl ModelContainer {
         Ok(found)
     }
 
-    fn create_table<M: Model>(&self) -> Result<(), DbError> {
-        let specs = self.inner.fk_specs.borrow();
-        let cols: Vec<String> = M::COLUMNS
+    /// `M`'s declared DDL under `table_sql` (its own quoted name, or the `_new` name a
+    /// rebuild copies into). The fresh form carries every constraint inline; the upgrade
+    /// paths produce the same enforced constraints by other means (a `NOT NULL DEFAULT`
+    /// addition, a `day_uidx_` unique index), and the comparison treats them as equal.
+    fn create_table_named<M: Model>(&self, table_sql: String) -> Result<(), DbError> {
+        let cols: Vec<String> = self
+            .declared_columns::<M>()
             .iter()
-            .map(|c| {
+            .map(|d| {
+                let c = &d.def;
                 let mut s = format!("{} {}", ident(c.name), c.sql.ddl());
-                if c.name == M::KEY {
+                if d.pk {
                     s.push_str(" PRIMARY KEY");
                 } else if c.not_null {
                     s.push_str(" NOT NULL");
                 }
-                if c.unique && c.name != M::KEY {
+                if c.unique && !d.pk {
                     s.push_str(" UNIQUE");
                 }
                 // A declared relation's foreign key: enforced by the engine too, so another
@@ -2396,25 +2764,13 @@ impl ModelContainer {
                 // this process never faulted still lands in the file. Deferred, so
                 // within-transaction statement order (a cascade's children, an undo's
                 // re-inserts) never trips it.
-                if let Some(spec) = specs
-                    .iter()
-                    .find(|f| f.child_table == M::TABLE && f.child_field == c.field)
-                {
-                    s.push_str(&format!(
-                        " REFERENCES {}({}) ON DELETE {} DEFERRABLE INITIALLY DEFERRED",
-                        spec.parent_sql,
-                        ident(spec.parent_key),
-                        spec.rule.sql()
-                    ));
+                if let Some(fk) = &d.fk {
+                    s.push_str(&fk.clause());
                 }
                 s
             })
             .collect();
-        let body = format!(
-            "CREATE TABLE {} ({})",
-            TableName::of::<M>().sql(),
-            cols.join(", ")
-        );
+        let body = format!("CREATE TABLE {table_sql} ({})", cols.join(", "));
         // `STRICT` where the engine allows it (always, for the bundled build); older system
         // SQLites reject the keyword, and the plain form is the fallback.
         if self.conn().execute(&format!("{body} STRICT"), &[]).is_err() {
@@ -2423,11 +2779,13 @@ impl ModelContainer {
         Ok(())
     }
 
-    fn create_indexes<M: Model>(&self) -> Result<(), DbError> {
-        // A declared relation's foreign-key column is indexed without being asked: it is what
-        // `children_of` selects on, what relation predicates correlate on, and what the
-        // engine scans to enforce `ON DELETE`. Unindexed, every one of those is a full scan
-        // of the child table.
+    /// The indexes `M` owns in the file, by name: one per `indexed` column, one per declared
+    /// relation's foreign-key column (what `children_of` selects on, what relation predicates
+    /// correlate on, and what the engine scans to enforce `ON DELETE`; unindexed, each is a
+    /// full scan of the child table), one per composite declaration, and a unique index for
+    /// each column in `unique_indexes`, the declared-unique columns whose table carries no
+    /// inline `UNIQUE` because they arrived through `ADD COLUMN`.
+    fn declared_indexes<M: Model>(&self, unique_indexes: &[&'static str]) -> Vec<DeclaredIndex> {
         let fk_cols: Vec<&str> = self
             .inner
             .fk_specs
@@ -2441,27 +2799,39 @@ impl ModelContainer {
                     .map(|c| c.name)
             })
             .collect();
-        let name = TableName::of::<M>();
-        let t = name.sql();
-        for c in M::COLUMNS
+        let bare = TableName::of::<M>().bare;
+        let mut out: Vec<DeclaredIndex> = M::COLUMNS
             .iter()
             .filter(|c| c.indexed || (fk_cols.contains(&c.name) && c.name != M::KEY))
-        {
+            .map(|c| DeclaredIndex {
+                name: format!("day_idx_{bare}_{}", c.name),
+                columns: vec![c.name.to_string()],
+                unique: false,
+            })
+            .collect();
+        out.extend(M::COMPOSITE_INDEXES.iter().map(|idx| DeclaredIndex {
+            name: format!("day_idx_{bare}_{}", idx.join("_")),
+            columns: idx.iter().map(|c| c.to_string()).collect(),
+            unique: false,
+        }));
+        out.extend(unique_indexes.iter().map(|c| DeclaredIndex {
+            name: format!("day_uidx_{bare}_{c}"),
+            columns: vec![c.to_string()],
+            unique: true,
+        }));
+        out
+    }
+
+    fn create_indexes<M: Model>(&self, unique_indexes: &[&'static str]) -> Result<(), DbError> {
+        let name = TableName::of::<M>();
+        let t = name.sql();
+        for idx in self.declared_indexes::<M>(unique_indexes) {
             self.conn().execute(
                 &format!(
-                    "CREATE INDEX IF NOT EXISTS {} ON {t}({})",
-                    ident(&format!("day_idx_{}_{}", name.bare, c.name)),
-                    ident(c.name)
-                ),
-                &[],
-            )?;
-        }
-        for idx in M::COMPOSITE_INDEXES {
-            self.conn().execute(
-                &format!(
-                    "CREATE INDEX IF NOT EXISTS {} ON {t}({})",
-                    ident(&format!("day_idx_{}_{}", name.bare, idx.join("_"))),
-                    column_list(idx)
+                    "CREATE {}INDEX IF NOT EXISTS {} ON {t}({})",
+                    if idx.unique { "UNIQUE " } else { "" },
+                    table_sql(name.schema, &idx.name),
+                    column_list(&idx.columns)
                 ),
                 &[],
             )?;
@@ -2469,48 +2839,445 @@ impl ModelContainer {
         Ok(())
     }
 
-    /// Close the gap between the file's columns and the declared ones: additions and drops
-    /// only. A type change or a rename is refused with both names in the error; that is what
-    /// staged migrations are for.
-    fn lightweight_migrate<M: Model>(&self) -> Result<(), DbError> {
-        let mut existing: Vec<String> = Vec::new();
+    /// `M`'s columns as declared, with the relation-contributed foreign key resolved: the
+    /// declared side of [`ModelContainer::compare_schema`], and what the DDL is written from.
+    fn declared_columns<M: Model>(&self) -> Vec<DeclaredColumn> {
+        let specs = self.inner.fk_specs.borrow();
+        M::COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(index, c)| DeclaredColumn {
+                def: *c,
+                index,
+                pk: c.name == M::KEY,
+                fk: specs
+                    .iter()
+                    .find(|f| f.child_table == M::TABLE && f.child_field == c.field)
+                    .map(|s| DeclaredFk {
+                        parent_sql: s.parent_sql.clone(),
+                        parent_bare: s.parent_bare,
+                        parent_key: s.parent_key,
+                        rule: s.rule,
+                    }),
+            })
+            .collect()
+    }
+
+    /// The table as the file has it: `PRAGMA table_info`, `foreign_key_list`, `index_list`
+    /// and `index_info`, read into one value the comparison and the rebuild both consume.
+    fn file_schema(&self, name: TableName) -> Result<FileSchema, DbError> {
+        let mut columns: Vec<FileColumn> = Vec::new();
         self.conn().query(
-            &format!("PRAGMA table_info({})", TableName::of::<M>().sql()),
+            &pragma_sql(name.schema, "table_info", name.bare),
             &[],
             &mut |row| {
-                if let Ok(name) = row.get(1).as_text() {
-                    existing.push(name.to_string());
+                columns.push(FileColumn {
+                    name: row.get(1).as_text().unwrap_or("").to_string(),
+                    decl_type: row.get(2).as_text().unwrap_or("").to_ascii_uppercase(),
+                    not_null: row.get(3).as_int().unwrap_or(0) != 0,
+                    pk: row.get(5).as_int().unwrap_or(0) != 0,
+                    fk: None,
+                });
+            },
+        )?;
+        self.conn().query(
+            &pragma_sql(name.schema, "foreign_key_list", name.bare),
+            &[],
+            &mut |row| {
+                let from = row.get(3).as_text().unwrap_or("").to_string();
+                if let Some(col) = columns.iter_mut().find(|c| c.name == from) {
+                    col.fk = Some(FileFk {
+                        parent: row.get(2).as_text().unwrap_or("").to_string(),
+                        parent_key: row.get(4).as_text().unwrap_or("").to_string(),
+                        on_delete: row.get(6).as_text().unwrap_or("").to_ascii_uppercase(),
+                    });
+                }
+            },
+        )?;
+        let mut indexes: Vec<FileIndex> = Vec::new();
+        self.conn().query(
+            &pragma_sql(name.schema, "index_list", name.bare),
+            &[],
+            &mut |row| {
+                indexes.push(FileIndex {
+                    name: row.get(1).as_text().unwrap_or("").to_string(),
+                    unique: row.get(2).as_int().unwrap_or(0) != 0,
+                    origin: row.get(3).as_text().unwrap_or("").to_string(),
+                    columns: Vec::new(),
+                });
+            },
+        )?;
+        for idx in &mut indexes {
+            let mut cols: Vec<(i64, String)> = Vec::new();
+            self.conn().query(
+                &pragma_sql(name.schema, "index_info", &idx.name),
+                &[],
+                &mut |row| {
+                    cols.push((
+                        row.get(0).as_int().unwrap_or(0),
+                        row.get(2).as_text().unwrap_or("").to_string(),
+                    ));
+                },
+            )?;
+            cols.sort_by_key(|(seq, _)| *seq);
+            idx.columns = cols.into_iter().map(|(_, c)| c).collect();
+        }
+        Ok(FileSchema { columns, indexes })
+    }
+
+    /// Decide how the file's table reaches the declaration. Column and index additions and
+    /// drops are closed in place; any other difference (a type, a nullability, a unique
+    /// constraint, a foreign key or its delete action) is a rebuild; a change the rebuild
+    /// could not fill truthfully (the key column, a required column with no usable default)
+    /// is refused here, before anything is touched.
+    fn compare_schema<M: Model>(&self, file: &FileSchema) -> Result<SchemaDelta, DbError> {
+        let declared = self.declared_columns::<M>();
+        let defaults = M::default_row();
+        let bare = TableName::of::<M>().bare;
+        let refuse = |column: &str, what: String| {
+            Err(DbError::new(
+                DbErrorKind::Schema,
+                format!(
+                    "`{}`.`{column}`: {what}; this is not a change the container can make to \
+                     an existing table, and it refuses to open rather than guess (a staged \
+                     migration can make it)",
+                    M::TABLE
+                ),
+            ))
+        };
+        let mut plan = LightweightPlan::default();
+        // Any one of these differences needs the copy; which one is immaterial to the work.
+        let mut rebuild = false;
+        let mut note = |_why: String| rebuild = true;
+        let inline_unique = |col: &str| {
+            file.indexes
+                .iter()
+                .any(|i| i.origin == "u" && i.columns.len() == 1 && i.columns[0] == col)
+        };
+        let unique_index_name = |col: &str| format!("day_uidx_{bare}_{col}");
+        let has_unique_index = |col: &str| {
+            let name = unique_index_name(col);
+            file.indexes
+                .iter()
+                .any(|i| i.name == name && i.unique && i.columns.len() == 1 && i.columns[0] == col)
+        };
+
+        for d in &declared {
+            let c = &d.def;
+            let default = Row::get(&defaults, d.index);
+            let required = c.not_null || d.pk;
+            match file.columns.iter().find(|f| f.name == c.name) {
+                None => {
+                    if d.pk {
+                        return refuse(c.name, "the declared key column is not in the file".into());
+                    }
+                    if required && default == Value::Null {
+                        return refuse(
+                            c.name,
+                            "a required column whose Rust default stores NULL cannot be \
+                             added to existing rows"
+                                .into(),
+                        );
+                    }
+                    if d.fk.is_some() && required {
+                        // `ADD COLUMN … REFERENCES` must default to NULL while foreign keys
+                        // are enforced; a required reference needs the copy.
+                        note(format!("required foreign-key column `{}` added", c.name));
+                    } else {
+                        plan.add.push(d.index);
+                        if c.unique {
+                            plan.unique_indexes.push(c.name);
+                        }
+                    }
+                }
+                Some(f) => {
+                    if f.decl_type != c.sql.ddl() {
+                        if d.pk {
+                            return refuse(
+                                c.name,
+                                format!(
+                                    "the key column is {} in the file and {} in the declaration",
+                                    f.decl_type,
+                                    c.sql.ddl()
+                                ),
+                            );
+                        }
+                        note(format!(
+                            "`{}` is {} in the file and {} in the declaration",
+                            c.name,
+                            f.decl_type,
+                            c.sql.ddl()
+                        ));
+                    }
+                    if f.pk != d.pk {
+                        return refuse(
+                            c.name,
+                            if d.pk {
+                                "declared as the key but not the file's primary key".into()
+                            } else {
+                                "the file's primary key but not the declared key".into()
+                            },
+                        );
+                    }
+                    // The key's NOT NULL is implied by PRIMARY KEY (and reported either way
+                    // by the engine, depending on its type), so only the other columns compare.
+                    if !d.pk && f.not_null != c.not_null {
+                        if c.not_null && default == Value::Null {
+                            return refuse(
+                                c.name,
+                                "becomes required, but its Rust default stores NULL, so \
+                                 existing NULLs cannot be filled"
+                                    .into(),
+                            );
+                        }
+                        note(format!(
+                            "`{}` is {} in the file and {} in the declaration",
+                            c.name,
+                            if f.not_null { "NOT NULL" } else { "nullable" },
+                            if c.not_null { "NOT NULL" } else { "nullable" }
+                        ));
+                    }
+                    let want_unique = c.unique && !d.pk;
+                    // A declared unique without the inline constraint owns its index,
+                    // whether that index exists yet or not (`IF NOT EXISTS` keeps one).
+                    match (want_unique, inline_unique(c.name), has_unique_index(c.name)) {
+                        (true, false, _) => plan.unique_indexes.push(c.name),
+                        (false, true, _) => note(format!(
+                            "`{}` carries UNIQUE but is not declared unique",
+                            c.name
+                        )),
+                        (false, false, true) => plan.drop_indexes.push(unique_index_name(c.name)),
+                        _ => {}
+                    }
+                    let fk_matches = match (&d.fk, &f.fk) {
+                        (None, None) => true,
+                        (Some(want), Some(have)) => {
+                            have.parent == want.parent_bare
+                                && have.parent_key == want.parent_key
+                                && have.on_delete == want.rule.sql()
+                        }
+                        _ => false,
+                    };
+                    if !fk_matches {
+                        note(format!("`{}`'s foreign key differs", c.name));
+                    }
+                }
+            }
+        }
+        for f in file
+            .columns
+            .iter()
+            .filter(|f| !declared.iter().any(|d| d.def.name == f.name))
+        {
+            if f.pk {
+                return refuse(&f.name, "the file's primary key is not declared".into());
+            }
+            // `DROP COLUMN` refuses a column under a constraint or a foreign index; those go
+            // through the copy, which simply leaves them out.
+            let covered_by_foreign_index = file.indexes.iter().any(|i| {
+                i.origin == "c" && !is_day_index(&i.name, bare) && i.columns.contains(&f.name)
+            });
+            if f.fk.is_some() || inline_unique(&f.name) || covered_by_foreign_index {
+                note(format!("constrained column `{}` dropped", f.name));
+            } else {
+                plan.drop.push(f.name.clone());
+            }
+        }
+        if let Some(extra) = file
+            .indexes
+            .iter()
+            .find(|i| i.origin == "u" && i.columns.len() > 1)
+        {
+            note(format!(
+                "undeclared multi-column UNIQUE constraint over ({})",
+                extra.columns.join(", ")
+            ));
+        }
+        // Day's own indexes: one that no longer matches a declaration is dropped in place;
+        // a missing one is created after the column work.
+        let want = self.declared_indexes::<M>(&plan.unique_indexes);
+        for i in file
+            .indexes
+            .iter()
+            .filter(|i| i.origin == "c" && is_day_index(&i.name, bare))
+        {
+            let matches = want
+                .iter()
+                .any(|w| w.name == i.name && w.columns == i.columns && w.unique == i.unique);
+            if !matches && !plan.drop_indexes.contains(&i.name) {
+                plan.drop_indexes.push(i.name.clone());
+            }
+        }
+        Ok(if rebuild {
+            SchemaDelta::Rebuild
+        } else {
+            SchemaDelta::Lightweight(plan)
+        })
+    }
+
+    /// Close the gap in place: indexes that no longer match are dropped, missing columns are
+    /// added with their declared constraints (`NOT NULL DEFAULT <Rust default>`; a nullable
+    /// foreign key with its `REFERENCES`), and columns the declaration lost are dropped.
+    /// Declared-unique additions get their unique index from `create_indexes`, since
+    /// `ADD COLUMN` cannot carry `UNIQUE`.
+    fn lightweight_migrate<M: Model>(&self, plan: &LightweightPlan) -> Result<(), DbError> {
+        let name = TableName::of::<M>();
+        let t = name.sql();
+        let declared = self.declared_columns::<M>();
+        let defaults = M::default_row();
+        for idx in &plan.drop_indexes {
+            self.conn().execute(
+                &format!("DROP INDEX IF EXISTS {}", table_sql(name.schema, idx)),
+                &[],
+            )?;
+        }
+        for &i in &plan.add {
+            let d = &declared[i];
+            let c = &d.def;
+            let default = Row::get(&defaults, i);
+            let mut ddl = format!(
+                "ALTER TABLE {t} ADD COLUMN {} {}",
+                ident(c.name),
+                c.sql.ddl()
+            );
+            if c.not_null {
+                ddl.push_str(&format!(" NOT NULL DEFAULT {}", sql_literal(&default)?));
+            }
+            if let Some(fk) = &d.fk {
+                ddl.push_str(&fk.clause());
+            }
+            self.conn().execute(&ddl, &[])?;
+            // A nullable column whose Rust default is a value still backfills, as before.
+            if !c.not_null && default != Value::Null {
+                self.conn()
+                    .execute(&format!("UPDATE {t} SET {} = ?", ident(c.name)), &[default])?;
+            }
+        }
+        for gone in &plan.drop {
+            self.conn()
+                .execute(&format!("ALTER TABLE {t} DROP COLUMN {}", ident(gone)), &[])?;
+        }
+        Ok(())
+    }
+
+    /// SQLite's documented procedure for every other change
+    /// (<https://www.sqlite.org/lang_altertable.html#otheralter>): the declared table is
+    /// created under a temporary name, the rows copied across (shared columns as they are,
+    /// a required column that was nullable through `COALESCE` with its Rust default, a
+    /// missing one from that default), the old table dropped, the new one renamed into
+    /// place, and the application's own indexes that still apply re-created. The caller
+    /// holds the transaction, has foreign keys off, and runs `foreign_key_check` after.
+    /// Application-owned triggers on the table go with it; their owner re-creates them.
+    fn rebuild_table<M: Model>(&self, file: &FileSchema) -> Result<(), DbError> {
+        let name = TableName::of::<M>();
+        let t = name.sql();
+        let bare = name.bare;
+        let tmp_bare = format!("{bare}_new");
+        let tmp = table_sql(name.schema, &tmp_bare);
+        let declared = self.declared_columns::<M>();
+        let defaults = M::default_row();
+        let master = table_sql(name.schema, "sqlite_master");
+
+        // The application's own indexes, to re-create when every column they name survives.
+        let mut foreign_indexes: Vec<String> = Vec::new();
+        self.conn().query(
+            &format!(
+                "SELECT name, sql FROM {master} WHERE type = 'index' AND tbl_name = ? \
+                 AND sql IS NOT NULL"
+            ),
+            &[Value::Text(bare.into())],
+            &mut |row| {
+                let idx_name = row.get(0).as_text().unwrap_or("").to_string();
+                if is_day_index(&idx_name, bare) {
+                    return;
+                }
+                let survives = file
+                    .indexes
+                    .iter()
+                    .find(|i| i.name == idx_name)
+                    .is_some_and(|i| {
+                        i.columns
+                            .iter()
+                            .all(|c| declared.iter().any(|d| d.def.name == c))
+                    });
+                if survives && let Ok(sql) = row.get(1).as_text() {
+                    foreign_indexes.push(sql.to_string());
                 }
             },
         )?;
 
-        let declared: Vec<&'static str> = M::COLUMNS.iter().map(|c| c.name).collect();
-        let defaults = M::default_row();
-        let t = TableName::of::<M>().sql();
-
-        for (i, col) in M::COLUMNS.iter().enumerate() {
-            if !existing.iter().any(|e| e == col.name) {
-                // Add nullable, then backfill with the field's Rust default.
-                self.conn().execute(
-                    &format!(
-                        "ALTER TABLE {t} ADD COLUMN {} {}",
-                        ident(col.name),
-                        col.sql.ddl()
-                    ),
-                    &[],
-                )?;
-                let default = Row::get(&defaults, i);
-                if default != Value::Null {
-                    self.conn().execute(
-                        &format!("UPDATE {t} SET {} = ?", ident(col.name)),
-                        &[default],
-                    )?;
+        // Triggers on the table go with `DROP TABLE`; the application's come back verbatim
+        // after the rename when every column they name survives (Day's generated ones are
+        // reconciled afterwards anyway). Checked by a dry parse against the new table.
+        let mut triggers: Vec<String> = Vec::new();
+        self.conn().query(
+            &format!(
+                "SELECT sql FROM {master} WHERE type = 'trigger' AND tbl_name = ? \
+                 AND sql IS NOT NULL ORDER BY rowid"
+            ),
+            &[Value::Text(bare.into())],
+            &mut |row| {
+                if let Ok(sql) = row.get(0).as_text() {
+                    triggers.push(sql.to_string());
                 }
-            }
+            },
+        )?;
+
+        let wrap =
+            |e: DbError| DbError::new(e.kind, format!("rebuilding `{}`: {}", M::TABLE, e.message));
+        self.conn()
+            .execute(&format!("DROP TABLE IF EXISTS {tmp}"), &[])
+            .map_err(wrap)?;
+        self.create_table_named::<M>(tmp.clone()).map_err(wrap)?;
+        let targets = column_list(&declared.iter().map(|d| d.def.name).collect::<Vec<_>>());
+        let mut sources: Vec<String> = Vec::with_capacity(declared.len());
+        for d in &declared {
+            let c = &d.def;
+            let default = Row::get(&defaults, d.index);
+            let required = c.not_null || d.pk;
+            let shared = file.columns.iter().find(|f| f.name == c.name);
+            sources.push(match shared {
+                Some(f) if !required || f.not_null => ident(c.name),
+                Some(_) => format!(
+                    "COALESCE({}, {})",
+                    ident(c.name),
+                    sql_literal(&default).map_err(wrap)?
+                ),
+                None => sql_literal(&default).map_err(wrap)?,
+            });
         }
-        for gone in existing.iter().filter(|e| !declared.iter().any(|d| d == e)) {
-            self.conn()
-                .execute(&format!("ALTER TABLE {t} DROP COLUMN {}", ident(gone)), &[])?;
+        self.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {tmp} ({targets}) SELECT {} FROM {t}",
+                    sources.join(", ")
+                ),
+                &[],
+            )
+            .map_err(wrap)?;
+        self.conn()
+            .execute(&format!("DROP TABLE {t}"), &[])
+            .map_err(wrap)?;
+        // Other tables' triggers and views may name this table (an adapter's capture trigger
+        // on a child table reads the parent), and a rename checks every such reference
+        // against a schema the table is momentarily absent from. The legacy rename leaves
+        // those references as written, which is what a rebuild under the same name wants.
+        self.conn()
+            .execute_batch("PRAGMA legacy_alter_table = ON")
+            .map_err(wrap)?;
+        let renamed = self
+            .conn()
+            .execute(&format!("ALTER TABLE {tmp} RENAME TO {}", ident(bare)), &[]);
+        self.conn()
+            .execute_batch("PRAGMA legacy_alter_table = OFF")
+            .map_err(wrap)?;
+        renamed.map_err(wrap)?;
+        for sql in foreign_indexes {
+            self.conn().execute(&sql, &[]).map_err(wrap)?;
+        }
+        for sql in triggers {
+            // A trigger naming a dropped column cannot come back; its owner recreates it.
+            let _ = self.conn().execute(&sql, &[]);
         }
         Ok(())
     }
@@ -2574,7 +3341,8 @@ impl ModelContainer {
     }
 
     fn flush(&self, dirty: &DirtyState) -> Result<Vec<(String, Vec<Value>)>, DbError> {
-        let stmts = self.fold(dirty)?;
+        let capture = self.inner.participant.borrow().is_some();
+        let (stmts, changes) = self.fold(dirty, capture)?;
         if stmts.is_empty() {
             return Ok(stmts);
         }
@@ -2587,10 +3355,14 @@ impl ModelContainer {
                 return Err(error);
             }
         }
+        // After begin (which clears the set) and before the statements: an outer worker
+        // transaction accumulates every inner flush, and rolls the set back with the rest.
+        self.record_changes(changes);
         for (sql, params) in &stmts {
             if let Err(e) = conn.execute(sql, params) {
                 if !outer {
                     let _ = conn.rollback();
+                    self.participant_rollback();
                 }
                 return Err(e);
             }
@@ -2601,6 +3373,7 @@ impl ModelContainer {
                 .and_then(|_| conn.commit())
         {
             let _ = conn.rollback();
+            self.participant_rollback();
             return Err(error);
         }
         Ok(stmts)
@@ -2658,6 +3431,7 @@ impl ModelContainer {
         });
         self.inner.worker_transaction.set(false);
         if result.is_err() {
+            self.participant_rollback();
             self.conn().rollback().map_err(|error| {
                 DbError::new(
                     DbErrorKind::Closed,
@@ -2667,7 +3441,7 @@ impl ModelContainer {
             self.worker_discard_changes()?;
         }
         if result.is_ok() {
-            self.participant_refresh(origin)?;
+            self.participant_refresh()?;
         }
         result
     }
@@ -2714,6 +3488,7 @@ impl ModelContainer {
     fn worker_discard_changes(&self) -> Result<(), DbError> {
         let autosave = self.inner.autosave.replace(false);
         *self.inner.dirty.borrow_mut() = DirtyState::default();
+        self.participant_rollback();
         let result = self.refresh_resident();
         self.invalidate_relation_memos();
         if result.is_ok() {
@@ -2732,9 +3507,25 @@ impl ModelContainer {
     /// first-touch order. Row values come from the caches now; the change log carried which
     /// rows and columns moved, never their contents. Reads only; [`ModelContainer::flush`]
     /// executes the list in one transaction.
-    fn fold(&self, dirty: &DirtyState) -> Result<Vec<(String, Vec<Value>)>, DbError> {
+    ///
+    /// With `capture`, the second answer is the same work as a change set, one entry per row
+    /// a statement writes (the participant's view of the flush); without it, empty.
+    #[allow(clippy::type_complexity)]
+    fn fold(
+        &self,
+        dirty: &DirtyState,
+        capture: bool,
+    ) -> Result<(Vec<(String, Vec<Value>)>, Vec<RowChange>), DbError> {
         let tables = self.inner.tables.borrow();
         let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
+        let mut changes: Vec<RowChange> = Vec::new();
+        let authors_of = |store_id: u64, key: u64| -> Vec<&'static str> {
+            dirty
+                .authors
+                .get(&(store_id, key))
+                .cloned()
+                .unwrap_or_default()
+        };
 
         // Wholesale rewrites first: upsert every resident row. (The cache is a working set;
         // rows outside it were never part of the rewrite, and deleting "the rest" would
@@ -2743,8 +3534,24 @@ impl ModelContainer {
             let Some(hooks) = tables.get(store_id) else {
                 continue;
             };
-            for (_, row) in (hooks.all_rows)() {
+            for (key, row) in (hooks.all_rows)() {
                 stmts.push(upsert_stmt(hooks, &row));
+                if capture {
+                    let mut authors = dirty
+                        .store_authors
+                        .get(store_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    for tag in authors_of(*store_id, key) {
+                        add_author(&mut authors, Some(tag));
+                    }
+                    changes.push(RowChange {
+                        table: hooks.table,
+                        key: (hooks.key_where)(key).1,
+                        kind: RowChangeKind::Rewritten,
+                        authors,
+                    });
+                }
             }
         }
 
@@ -2780,8 +3587,19 @@ impl ModelContainer {
             // A join row is addressed by a pair of columns, which no single-column `IN` can
             // express, so those keep one statement each.
             let batchable = hooks.key_cols.len() == 1;
+            let mut capture_as = |kind: RowChangeKind| {
+                if capture {
+                    changes.push(RowChange {
+                        table: hooks.table,
+                        key: (hooks.key_where)(key).1,
+                        kind,
+                        authors: authors_of(store_id, key),
+                    });
+                }
+            };
             match state {
                 DirtyRow::Delete => {
+                    capture_as(RowChangeKind::Deleted);
                     if !batchable {
                         let (clause, params) = (hooks.key_where)(key);
                         deletes.push(Batch::Single(
@@ -2796,6 +3614,7 @@ impl ModelContainer {
                     if let Some(row) = (hooks.row_for)(key) {
                         let (sql, params) = upsert_stmt(hooks, &row);
                         batches.push(Batch::Single(sql, params));
+                        capture_as(RowChangeKind::Inserted);
                     }
                 }
                 DirtyRow::Update(cols) => {
@@ -2806,6 +3625,7 @@ impl ModelContainer {
                         // A row-level replacement named no columns; write them all.
                         let (sql, params) = upsert_stmt(hooks, &row);
                         batches.push(Batch::Single(sql, params));
+                        capture_as(RowChangeKind::Rewritten);
                         continue;
                     }
                     let mut sets: Vec<String> = Vec::with_capacity(cols.len());
@@ -2819,6 +3639,14 @@ impl ModelContainer {
                     }
                     if set_params.is_empty() {
                         continue; // only transient fields changed
+                    }
+                    if capture {
+                        let written: Vec<&'static str> = cols
+                            .iter()
+                            .filter_map(|c| hooks.fields.iter().position(|n| n == c))
+                            .map(|i| hooks.column_names[i])
+                            .collect();
+                        capture_as(RowChangeKind::Updated(written));
                     }
                     let clause = sets.join(", ");
                     if !batchable {
@@ -2856,7 +3684,7 @@ impl ModelContainer {
                 }
             }
         }
-        Ok(stmts)
+        Ok((stmts, changes))
     }
 
     // --- maintenance (docs/persistence.md) ---------------------------------------------------
@@ -2872,7 +3700,10 @@ impl ModelContainer {
         Ok(())
     }
 
-    /// `PRAGMA integrity_check`, parsed: an empty list means the database is sound.
+    /// `PRAGMA integrity_check` and `PRAGMA foreign_key_check`, parsed: an empty list means
+    /// the database is sound. A foreign-key violation reads
+    /// `foreign key: <child> row <rowid> references missing <parent>`; the structured form is
+    /// [`ModelContainer::foreign_key_check`].
     pub fn integrity_check(&self) -> Result<Vec<String>, DbError> {
         let mut findings = Vec::new();
         self.conn()
@@ -2883,14 +3714,48 @@ impl ModelContainer {
                     findings.push(t.to_string());
                 }
             })?;
+        for v in self.foreign_key_check()? {
+            findings.push(v.to_string());
+        }
         Ok(findings)
     }
 
-    /// Fold the WAL into the main file, before the OS copies it whole (device backup).
-    pub fn checkpoint(&self) -> Result<(), DbError> {
-        // The PRAGMA answers with a status row; a query with an ignored callback consumes it.
+    /// `PRAGMA foreign_key_check`, parsed: every row whose foreign key names a parent that
+    /// does not exist. Empty when every reference resolves. Runs on the whole file, which is
+    /// what a migration's post-check and a settings-page validation both want.
+    pub fn foreign_key_check(&self) -> Result<Vec<ForeignKeyViolation>, DbError> {
+        Self::foreign_key_check_on(self.conn().as_mut())
+    }
+
+    fn foreign_key_check_on(
+        conn: &mut dyn SqliteConnection,
+    ) -> Result<Vec<ForeignKeyViolation>, DbError> {
+        let mut violations = Vec::new();
+        conn.query("PRAGMA foreign_key_check", &[], &mut |row| {
+            violations.push(ForeignKeyViolation {
+                table: row.get(0).as_text().unwrap_or("").to_string(),
+                rowid: row.get(1).as_int().ok(),
+                parent: row.get(2).as_text().unwrap_or("").to_string(),
+                constraint: row.get(3).as_int().unwrap_or(0),
+            });
+        })?;
+        Ok(violations)
+    }
+
+    /// Fold the WAL into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`), before the OS
+    /// copies it whole (device backup). The engine's own answer comes back: whether a reader
+    /// kept the checkpoint from completing, and how much of the log it folded.
+    pub fn checkpoint(&self) -> Result<Checkpoint, DbError> {
+        let mut result = Checkpoint::default();
         self.conn()
-            .query("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut |_| {})
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut |row| {
+                result = Checkpoint {
+                    busy: row.get(0).as_int().unwrap_or(0) != 0,
+                    log_frames: row.get(1).as_int().unwrap_or(-1),
+                    checkpointed_frames: row.get(2).as_int().unwrap_or(-1),
+                };
+            })?;
+        Ok(result)
     }
 
     pub fn vacuum(&self) -> Result<(), DbError> {
@@ -2970,6 +3835,152 @@ pub(crate) fn prefixed_list<S: AsRef<str>>(prefix: &str, columns: &[S]) -> Strin
         .map(|c| format!("{prefix}.{}", ident(c.as_ref())))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The two halves of an FTS update trigger's gate: the `UPDATE OF` column list (the key and
+/// every indexed column, once each) and the `WHEN` expression that is true only if one of
+/// them actually changed (`IS NOT`, so a NULL on either side compares like any value).
+fn fts_update_guard(key: &str, fts_columns: &[&str]) -> (String, String) {
+    let mut cols: Vec<&str> = vec![key];
+    cols.extend(fts_columns.iter().copied().filter(|c| *c != key));
+    let update_of = column_list(&cols);
+    let changed = cols
+        .iter()
+        .map(|c| {
+            let c = ident(c);
+            format!("new.{c} IS NOT old.{c}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    (update_of, changed)
+}
+
+// ---------------------------------------------------------------------------
+// Schema comparison: the declaration against the file
+// ---------------------------------------------------------------------------
+
+/// One column as the model declares it, with the relation-contributed foreign key resolved.
+struct DeclaredColumn {
+    def: ColumnDef,
+    /// Position in `Model::COLUMNS`, which is also the position in `Model::default_row()`.
+    index: usize,
+    pk: bool,
+    fk: Option<DeclaredFk>,
+}
+
+/// A declared relation's foreign key on a child column.
+struct DeclaredFk {
+    parent_sql: String,
+    parent_bare: &'static str,
+    parent_key: &'static str,
+    rule: DeleteRule,
+}
+
+impl DeclaredFk {
+    /// The column constraint, deferred so within-transaction statement order (a cascade's
+    /// children, an undo's re-inserts) never trips it.
+    fn clause(&self) -> String {
+        format!(
+            " REFERENCES {}({}) ON DELETE {} DEFERRABLE INITIALLY DEFERRED",
+            self.parent_sql,
+            ident(self.parent_key),
+            self.rule.sql()
+        )
+    }
+}
+
+/// An index the container owns, as it is declared.
+struct DeclaredIndex {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+/// A column as `PRAGMA table_info` and `PRAGMA foreign_key_list` report it.
+struct FileColumn {
+    name: String,
+    /// Upper-cased declared type (`INTEGER`, `TEXT`, …).
+    decl_type: String,
+    not_null: bool,
+    pk: bool,
+    fk: Option<FileFk>,
+}
+
+struct FileFk {
+    parent: String,
+    parent_key: String,
+    on_delete: String,
+}
+
+/// An index as `PRAGMA index_list` and `index_info` report it. `origin` is `c` for a
+/// `CREATE INDEX`, `u` for an inline `UNIQUE`, `pk` for the primary key's.
+struct FileIndex {
+    name: String,
+    unique: bool,
+    origin: String,
+    columns: Vec<String>,
+}
+
+struct FileSchema {
+    columns: Vec<FileColumn>,
+    indexes: Vec<FileIndex>,
+}
+
+/// What `lightweight_migrate` does in place: positions in `COLUMNS` to add, file columns to
+/// drop, Day-owned index names to drop, and declared-unique columns that need a unique index.
+#[derive(Default, Clone)]
+struct LightweightPlan {
+    add: Vec<usize>,
+    drop: Vec<String>,
+    drop_indexes: Vec<String>,
+    unique_indexes: Vec<&'static str>,
+}
+
+/// The comparison's verdict for an existing table.
+enum SchemaDelta {
+    Lightweight(LightweightPlan),
+    Rebuild,
+}
+
+/// Whether an index name is one the container writes for `table` (`day_idx_`, `day_uidx_`).
+fn is_day_index(name: &str, table: &str) -> bool {
+    name.starts_with(&format!("day_idx_{table}_"))
+        || name.starts_with(&format!("day_uidx_{table}_"))
+}
+
+/// `PRAGMA [schema.]name("arg")`.
+fn pragma_sql(schema: Option<&str>, name: &str, arg: &str) -> String {
+    match schema {
+        Some(s) => format!("PRAGMA {}.{name}({})", ident(s), ident(arg)),
+        None => format!("PRAGMA {name}({})", ident(arg)),
+    }
+}
+
+/// A [`Value`] as an SQL literal, for the places a bound parameter cannot go (a column's
+/// `DEFAULT`, a copy's `SELECT` list): text single-quoted with `'` doubled, a blob as
+/// `X'…'`, numbers as themselves. A non-finite real has no literal and is refused.
+fn sql_literal(v: &Value) -> Result<String, DbError> {
+    Ok(match v {
+        Value::Null => "NULL".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Real(r) if r.is_finite() => format!("{r:?}"),
+        Value::Real(r) => {
+            return Err(DbError::new(
+                DbErrorKind::Schema,
+                format!("{r} has no SQL literal to use as a column default"),
+            ));
+        }
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Blob(b) => {
+            let mut s = String::with_capacity(b.len() * 2 + 3);
+            s.push_str("X'");
+            for byte in b {
+                s.push_str(&format!("{byte:02x}"));
+            }
+            s.push('\'');
+            s
+        }
+    })
 }
 
 fn keys_where_of(hooks: &TableHooks) -> KeysWhere {
@@ -3798,6 +4809,11 @@ impl ModelContainer {
     /// Re-select every resident row and feed the differences through the caches: per-field
     /// announcements, external deletions, all authored [`ModelContainer::EXTERNAL_AUTHOR`].
     fn refresh_resident(&self) -> Result<bool, DbError> {
+        self.refresh_resident_in(None)
+    }
+
+    /// [`ModelContainer::refresh_resident`] over the tables named (all of them for `None`).
+    fn refresh_resident_in(&self, only: Option<&[&'static str]>) -> Result<bool, DbError> {
         struct RefreshJob {
             resident_keys: Rc<dyn Fn() -> Vec<u64>>,
             refresh: RefreshFn,
@@ -3809,6 +4825,7 @@ impl ModelContainer {
             let tables = self.inner.tables.borrow();
             tables
                 .values()
+                .filter(|h| only.is_none_or(|t| t.contains(&h.table)))
                 .map(|h| RefreshJob {
                     resident_keys: h.resident_keys.clone(),
                     refresh: h.refresh.clone(),
@@ -4130,6 +5147,43 @@ impl ModelContainer {
         for state in states {
             state.needs_sql.set(false);
             self.requery(&state);
+        }
+    }
+
+    /// [`ModelContainer::requery_all`] for the live queries that read `tables`: a query over
+    /// one of them, one crossing into one through a relation (or that relation's join
+    /// table), or a raw query naming one.
+    fn requery_tables(&self, tables: &[&'static str]) {
+        let stores: Vec<u64> = self
+            .inner
+            .tables
+            .borrow()
+            .iter()
+            .filter(|(_, h)| tables.contains(&h.table))
+            .map(|(id, _)| *id)
+            .collect();
+        let states: Vec<Rc<QueryState>> = self
+            .inner
+            .queries
+            .borrow()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for state in states {
+            let reads = match &state.raw {
+                Some(raw) => raw.tables.iter().any(|t| tables.contains(&t.as_str())),
+                None => {
+                    stores.contains(&state.store_id)
+                        || state.watches.borrow().iter().any(|w| {
+                            stores.contains(&w.store)
+                                || w.join_store.is_some_and(|j| stores.contains(&j))
+                        })
+                }
+            };
+            if reads {
+                state.needs_sql.set(false);
+                self.requery(&state);
+            }
         }
     }
 

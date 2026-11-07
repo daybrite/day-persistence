@@ -1682,6 +1682,24 @@ impl ModelContainer {
         }
     }
 
+    /// Drop the memos of every relation with an end (or, for a many-to-many, its join
+    /// table) in `tables`: what a table-scoped refresh invalidates.
+    pub(crate) fn invalidate_relation_memos_of(&self, tables: &[&'static str]) {
+        for r in self.inner.relations.borrow().iter() {
+            if tables.contains(&r.parent_table) || tables.contains(&r.child_table) {
+                r.invalidate_all();
+            }
+        }
+        for j in self.inner.joins.borrow().iter() {
+            if tables.contains(&j.join_table)
+                || tables.contains(&j.a_table)
+                || tables.contains(&j.b_table)
+            {
+                j.invalidate_all();
+            }
+        }
+    }
+
     /// The cache for `M` when it is in this container's schema: the non-panicking
     /// [`ModelContainer::cache`].
     pub fn try_cache<M: Model>(&self) -> Option<Store<Keyed<M>>> {
@@ -1812,9 +1830,11 @@ impl ModelContainer {
         store: Store<Keyed<JoinRow>>,
     ) {
         let mut columns = vec![parent_col.to_string(), child_col.to_string()];
+        let mut column_names = vec![parent_col, child_col];
         let mut fields = vec![parent_col.to_string(), child_col.to_string()];
         if ordered {
             columns.push("position".into());
+            column_names.push("position");
             fields.push("position".into());
         }
         let to_row = move |r: &JoinRow| {
@@ -1857,6 +1877,7 @@ impl ModelContainer {
                 _ => (format!("{pc} IS NULL"), Vec::new()),
             }),
             columns,
+            column_names,
             fields,
             fts: None,
             fts_key: "rowid",

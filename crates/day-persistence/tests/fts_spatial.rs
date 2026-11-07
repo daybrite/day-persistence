@@ -571,3 +571,251 @@ fn wide_fts_backfills_reopens_and_survives_vacuum_and_tokenizer_migration() {
     }
     let _ = std::fs::remove_file(path);
 }
+
+// --- update triggers fire only for indexed content ------------------------------------------
+
+/// A wide-keyed FTS model with a column outside the indexed set.
+#[derive(Model, Clone, Default, PartialEq, Debug)]
+#[model(table = "wide_notes", fts("title"))]
+struct WideNote {
+    #[model(id)]
+    id: String,
+    title: String,
+    read: bool,
+}
+
+/// The FTS5 index's segment store, row by row: equal before and after means no index
+/// maintenance ran at all.
+fn fts_segments(c: &ModelContainer, table: &str) -> Vec<(i64, Vec<u8>)> {
+    let mut rows = Vec::new();
+    c.with_connection(|conn| {
+        conn.query(
+            &format!("SELECT id, block FROM \"{table}_fts_data\" ORDER BY id"),
+            &[],
+            &mut |r| {
+                rows.push((
+                    r.get(0).as_int().unwrap(),
+                    r.get(1).as_blob().unwrap().to_vec(),
+                ));
+            },
+        )
+    })
+    .expect("segments");
+    rows
+}
+
+fn traced_memory() -> (Sqlite, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    (
+        Sqlite::memory().trace_sql(move |sql| sink.borrow_mut().push(sql.to_string())),
+        seen,
+    )
+}
+
+#[test]
+fn updating_a_non_indexed_column_leaves_the_fts_index_untouched() {
+    let (driver, trace) = traced_memory();
+    let c = ModelContainer::open(driver, schema![Post]).expect("open");
+    c.cache::<Post>().update("seed", |k| {
+        k.push(Post {
+            id: 1,
+            title: "Autumn in Kyoto".into(),
+            body: "temples and maple leaves".into(),
+            lat: 35.0,
+            lon: 135.7,
+            done: false,
+        });
+    });
+    c.save().expect("seed flush");
+    let before = fts_segments(&c, "posts");
+    assert!(!before.is_empty());
+    let q = c
+        .query::<Post>()
+        .filter(Post::fts().matches("kyoto"))
+        .live();
+    assert_eq!(q.ids(), [1]);
+
+    // A flag flip through the container…
+    trace.borrow_mut().clear();
+    c.cache::<Post>().elem(1).done().write(true);
+    c.save().expect("flag flush");
+    let flag_statements = trace.borrow().clone();
+    assert!(
+        flag_statements
+            .iter()
+            .any(|s| s.starts_with("UPDATE \"posts\" SET \"done\"")),
+        "{flag_statements:?}"
+    );
+    assert!(
+        !flag_statements.iter().any(|s| s.contains("posts_fts")),
+        "no FTS statement ran for a non-indexed update: {flag_statements:?}"
+    );
+    // …and a same-value assignment to an indexed column, as another tool might write it…
+    trace.borrow_mut().clear();
+    c.with_connection(|conn| conn.execute("UPDATE posts SET title = title WHERE id = 1", &[]))
+        .expect("same-value update");
+    let same_value = trace.borrow().clone();
+    assert!(
+        !same_value.iter().any(|s| s.contains("posts_fts")),
+        "{same_value:?}"
+    );
+    // …leave the index's storage byte-for-byte as it was, and the search still answers.
+    assert_eq!(fts_segments(&c, "posts"), before);
+    assert_eq!(q.ids_untracked(), [1]);
+
+    // A real content change does reach the index.
+    trace.borrow_mut().clear();
+    c.cache::<Post>()
+        .elem(1)
+        .title()
+        .write("Spring in Kobe".into());
+    c.save().expect("title flush");
+    assert!(
+        trace.borrow().iter().any(|s| s.contains("posts_fts")),
+        "{:?}",
+        trace.borrow()
+    );
+    assert_ne!(fts_segments(&c, "posts"), before);
+    assert_eq!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("kobe"))
+            .live()
+            .ids(),
+        [1]
+    );
+    assert!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("kyoto"))
+            .live()
+            .ids()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_wide_key_non_indexed_update_leaves_the_fts_index_and_key_map_alone() {
+    let (driver, trace) = traced_memory();
+    let c = ModelContainer::open(driver, schema![WideNote]).expect("open");
+    c.insert(WideNote {
+        id: "n-1".into(),
+        title: "maple season".into(),
+        read: false,
+    });
+    c.save().expect("seed");
+    let before = fts_segments(&c, "wide_notes");
+    trace.borrow_mut().clear();
+    c.try_get::<WideNote>("n-1".to_owned())
+        .unwrap()
+        .unwrap()
+        .read()
+        .write(true);
+    c.save().expect("flag");
+    let statements = trace.borrow().clone();
+    assert!(
+        !statements.iter().any(|s| s.contains("wide_notes_fts")),
+        "{statements:?}"
+    );
+    assert_eq!(fts_segments(&c, "wide_notes"), before);
+    assert_eq!(
+        c.query::<WideNote>()
+            .filter(WideNote::fts().matches("maple"))
+            .live()
+            .count(),
+        1
+    );
+    // Indexed content and identity still re-index through the same trigger.
+    c.try_get::<WideNote>("n-1".to_owned())
+        .unwrap()
+        .unwrap()
+        .title()
+        .write("cherry season".into());
+    c.save().expect("title");
+    assert_eq!(
+        c.query::<WideNote>()
+            .filter(WideNote::fts().matches("cherry"))
+            .live()
+            .count(),
+        1
+    );
+    assert_eq!(
+        c.query::<WideNote>()
+            .filter(WideNote::fts().matches("maple"))
+            .live()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn changed_content_is_searchable_after_update_and_reopen_and_not_after_rollback() {
+    let path = std::env::temp_dir().join(format!(
+        "day-persistence-fts-rollback-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let c = ModelContainer::open(Sqlite::at(&path), schema![Post]).expect("open");
+        c.insert(Post {
+            id: 2,
+            title: "Osaka street food".into(),
+            body: "takoyaki near the river".into(),
+            lat: 34.7,
+            lon: 135.5,
+            done: false,
+        });
+        c.save().expect("seed");
+        c.get::<Post>(2u32)
+            .unwrap()
+            .title()
+            .write("Kobe night market".into());
+        c.save().expect("edit");
+        assert_eq!(
+            c.query::<Post>()
+                .filter(Post::fts().matches("kobe"))
+                .live()
+                .ids(),
+            [2]
+        );
+    }
+    let c = ModelContainer::open(Sqlite::at(&path), schema![Post]).expect("reopen");
+    assert_eq!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("kobe"))
+            .live()
+            .ids(),
+        [2],
+        "the change survives a reopen"
+    );
+    assert!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("osaka"))
+            .live()
+            .ids()
+            .is_empty()
+    );
+    // A rolled-back update takes its index maintenance with it.
+    c.with_connection(|conn| {
+        conn.execute_batch(
+            "BEGIN; UPDATE posts SET title = 'Nara deer park' WHERE id = 2; ROLLBACK;",
+        )
+    })
+    .expect("rollback");
+    assert!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("nara"))
+            .live()
+            .ids()
+            .is_empty(),
+        "nothing of the rolled-back update is searchable"
+    );
+    assert_eq!(
+        c.query::<Post>()
+            .filter(Post::fts().matches("kobe"))
+            .live()
+            .ids(),
+        [2]
+    );
+    drop(c);
+    let _ = std::fs::remove_file(&path);
+}

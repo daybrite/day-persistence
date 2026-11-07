@@ -16,6 +16,7 @@ open_memory = New in-memory database
 open_durable = Open or reopen named database
 integrity_check = Check database integrity
 checkpoint = Checkpoint write-ahead log
+checkpoint_busy = A reader kept the log open. { $folded } of { $frames } frames were folded; the rest waits for the next checkpoint.
 vacuum = Reclaim unused space
 records_help = Save creates a typed note or updates the existing ID through generated model bindings. Refresh reads the full typed query, including changes made in the SQL console.
 note_id = Record ID

@@ -317,7 +317,24 @@ fn database_page(s: Scene) -> impl Piece {
             .id(day::id!(integrity)),
         button(res::str::checkpoint())
             .action(move || {
-                let result = checkpoint.db.borrow().container.checkpoint();
+                let result = checkpoint
+                    .db
+                    .borrow()
+                    .container
+                    .checkpoint()
+                    .and_then(|done| {
+                        if done.is_complete() {
+                            Ok(())
+                        } else {
+                            Err(day_persistence::DbError::driver(
+                                res::str::checkpoint_busy(res::str::CheckpointBusy {
+                                    folded: done.checkpointed_frames,
+                                    frames: done.log_frames,
+                                })
+                                .format(),
+                            ))
+                        }
+                    });
                 checkpoint.finish(result);
             })
             .id(day::id!(checkpoint)),

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Queue-confined persistence. Neither model handles nor reactive signals cross the queue.
-use crate::{DbError, DbErrorKind, ModelContainer};
+use crate::{Checkpoint, DbError, DbErrorKind, ModelContainer};
 use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -462,6 +462,14 @@ impl DatabaseWorker {
     pub fn backup_to(&self, path: impl Into<std::path::PathBuf>) -> WorkerRequest<()> {
         let path = path.into();
         self.submit(true, move |session| session.db.backup_to(&path))
+    }
+
+    /// Checkpoint the write-ahead log after all earlier accepted work, outside any transaction
+    /// (a checkpoint cannot complete inside one). With `checkpoint_fullfsync` on, this is the
+    /// one point where a replication engine forces committed journal entries through the
+    /// drive cache before it publishes them.
+    pub fn checkpoint(&self) -> WorkerRequest<Checkpoint> {
+        self.submit(true, |session| session.db.checkpoint())
     }
 
     /// Explicitly merge writes from another connection on this queue, then refresh projections.

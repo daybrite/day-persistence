@@ -107,6 +107,10 @@ Applications must keep network waits, dialogs and user decisions outside databas
   close their own worker: these calls return an error instead of deadlocking.
 - `backup_to(path)` is a separate queued operation in autocommit mode. SQLite's `VACUUM INTO`
   supplies a consistent snapshot and cannot run inside a `read` or `write` transaction.
+- `checkpoint()` is likewise queued in autocommit mode, since a checkpoint cannot complete
+  inside a transaction, and answers with the engine's [`Checkpoint`] result. A replication
+  engine calls it once before publishing, so that with `checkpoint_fullfsync` on, every
+  committed journal entry has been forced through the drive cache before it leaves the device.
 
 ### Cancellation, pressure and lifecycle
 

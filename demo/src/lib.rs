@@ -193,7 +193,7 @@ pub fn root() -> AnyPiece {
                 page(exchange.clone(), exchange_page)
             })
             .id(day::id!(nav))
-            .grow(),
+            .grow(Dimension::Both),
     )
 }
 
@@ -218,12 +218,12 @@ fn page<P: Piece>(s: Scene, controls: fn(Scene) -> P) -> impl Piece {
                 .axis(SplitAxis::Vertical)
                 .fraction(s.console_share)
                 .id(day::id!(console_split))
-                .grow()
+                .grow(Dimension::Both)
             },
         )
-        .otherwise(move || scroll(controls(alone.clone()).padding(16.0)).grow()),
+        .otherwise(move || scroll(controls(alone.clone()).padding(16.0)).grow(Dimension::Both)),
     ))
-    .grow()
+    .grow(Dimension::Both)
     .toolbar(
         toolbar_toggle(day::id!(toggle_console), res::str::console_toggle(), shown)
             .image(res::vectors::console)
@@ -271,11 +271,11 @@ fn console(s: Scene) -> impl Piece {
             }),
         )
         .scroll_target(follow)
-        .grow(),
+        .grow(Dimension::Both),
     ))
     .spacing(8.0)
     .padding(12.0)
-    .grow()
+    .grow(Dimension::Both)
 }
 
 fn database_page(s: Scene) -> impl Piece {

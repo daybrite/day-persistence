@@ -11,7 +11,8 @@ on:
   schedule:
     # Nightly, against the newest day release: Day can change even when this repository has no
     # new commits. A push builds against day's main.
-    - cron: "15 7 * * *"
+    - cron: "0 5 * * *" # 05:00 Eastern; staggered across daybrite.
+      timezone: America/New_York
 permissions:
   contents: read
 jobs:

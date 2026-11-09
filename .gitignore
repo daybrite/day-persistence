@@ -8,3 +8,5 @@ build/
 /Cargo.lock
 /demo/Cargo.lock
 !AGENTS.md
+# Local SwiftData-versus-day-persistence comparison projects; never checked in.
+/compare/

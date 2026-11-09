@@ -1,9 +1,12 @@
 //! Persistence Lab: inspect and exercise the same public APIs an ordinary Day app uses.
+use day::ImageSource;
 use day::prelude::*;
-use day_persistence::Sqlite;
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use day_persistence::{BlobField, Sort, Sqlite};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 mod model;
-use model::{Database, Note, Trace};
+use model::{
+    Database, LazyPhoto, LazyPhotoFields, Note, Photo, PhotoFields, Picture, StatementCount, Trace,
+};
 
 day::resources!();
 day::day_start!(options: window(), root);
@@ -12,6 +15,7 @@ day::routes! {
     /// Stable routes shared by native navigation and the portable dayscript.
     pub(crate) enum Page {
         Database => "database", Records => "records", Sql => "sql", Exchange => "exchange",
+        Gallery => "gallery",
     }
 }
 
@@ -34,6 +38,12 @@ struct Scene {
     results: Signal<String>,
     exchange: Signal<String>,
     trace: Trace,
+    /// Every statement the engine ran, counted: what the gallery compares eager and lazy by.
+    statements: StatementCount,
+    /// Whether the gallery shows the lazy table (the default) or the eager one.
+    gallery_lazy: Signal<bool>,
+    /// How many pictures the gallery holds, refreshed after a seed and when the page opens.
+    gallery_count: Signal<String>,
     /// Whether the SQL log shows under the page; the toolbar toggle flips it.
     console: Signal<bool>,
     /// The page's share of a page split, kept across pages so the divider stays put.
@@ -44,8 +54,13 @@ impl Scene {
     /// A fresh in-memory database is safe for exploration; durable storage is an explicit action.
     fn new() -> Result<Self, day_persistence::DbError> {
         let trace = Signal::new(VecDeque::new());
+        let statements = Signal::new(0);
         Ok(Self {
-            db: Rc::new(RefCell::new(Database::open(Sqlite::memory(), trace)?)),
+            db: Rc::new(RefCell::new(Database::open(
+                Sqlite::memory(),
+                trace,
+                statements,
+            )?)),
             status: Signal::new(res::str::memory_open().format()),
             name: Signal::new("lab.db".into()),
             id: Signal::new("1".into()),
@@ -58,6 +73,9 @@ impl Scene {
             results: Signal::new(String::new()),
             exchange: Signal::new("[]".into()),
             trace,
+            statements,
+            gallery_lazy: Signal::new(true),
+            gallery_count: Signal::new("0".into()),
             console: Signal::new(true),
             console_share: Signal::new(0.6),
         })
@@ -145,7 +163,7 @@ impl Scene {
             } else {
                 Sqlite::memory()
             };
-            *self.db.borrow_mut() = Database::open(driver, self.trace)?;
+            *self.db.borrow_mut() = Database::open(driver, self.trace, self.statements)?;
             Ok(())
         })();
         self.finish(result);
@@ -167,6 +185,78 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// Bring the gallery's count up to date from the table.
+    fn refresh_gallery_count(&self) {
+        let count = self.db.borrow().gallery_count();
+        match count {
+            Ok(n) => self.gallery_count.set(n.to_string()),
+            Err(error) => self
+                .status
+                .set(res::str::operation_failed(error.to_string()).format()),
+        }
+    }
+
+    /// Store pictures in both gallery tables and report.
+    fn store_pictures(&self, pictures: Vec<Picture>) {
+        let stored = self.db.borrow().seed_gallery(pictures);
+        match stored {
+            Ok(n) => self.status.set(res::str::seed_done(n as i64).format()),
+            Err(error) => self
+                .status
+                .set(res::str::operation_failed(error.to_string()).format()),
+        }
+        self.refresh_gallery_count();
+    }
+
+    /// The offline seed: distinct PNGs drawn here, so the gallery works without a network and
+    /// the dayscript never reaches for one.
+    fn seed_generated(&self) {
+        self.store_pictures(model::generated_pictures(GALLERY_SIZE));
+    }
+
+    /// The online seed: sample photos from picsum.photos, one request each, with the
+    /// generated pictures as the fallback when the network says no.
+    fn seed_download(&self) {
+        let scene = self.clone();
+        day::task(async move {
+            let mut pictures = Vec::with_capacity(GALLERY_SIZE);
+            for i in 0..GALLERY_SIZE {
+                scene.status.set(
+                    res::str::seed_downloading(res::str::SeedDownloading {
+                        done: i as i64,
+                        total: GALLERY_SIZE as i64,
+                    })
+                    .format(),
+                );
+                let url = format!("https://picsum.photos/seed/persistence-lab-{i}/160/160.jpg");
+                let request = day_part_http::Request::get(&url);
+                let reason = match day_part_http::fetch_future(request).await {
+                    Ok(response)
+                        if (200..300).contains(&response.status) && !response.body.is_empty() =>
+                    {
+                        pictures.push(Picture {
+                            title: format!("Sample photo {}", i + 1),
+                            source: url,
+                            bytes: response.body,
+                        });
+                        continue;
+                    }
+                    Ok(response) => format!("HTTP {}", response.status),
+                    Err(error) => error.to_string(),
+                };
+                scene.store_pictures(model::generated_pictures(GALLERY_SIZE));
+                scene.status.set(res::str::seed_failed(reason).format());
+                return;
+            }
+            scene.store_pictures(pictures);
+        });
+    }
+}
+
+/// How many pictures a seed stores.
+const GALLERY_SIZE: usize = 120;
+
 /// Compose one window's connection and controls: https://daybrite.dev/docs/navigation/.
 pub fn root() -> AnyPiece {
     let scene = match Scene::new() {
@@ -176,6 +266,7 @@ pub fn root() -> AnyPiece {
     let db = scene.clone();
     let records = scene.clone();
     let sql = scene.clone();
+    let gallery = scene.clone();
     let exchange = scene;
     AnyPiece::new(
         nav(Signal::new(Page::Database))
@@ -191,6 +282,9 @@ pub fn root() -> AnyPiece {
             })
             .item(Page::Exchange, res::str::nav_exchange(), move || {
                 page(exchange.clone(), exchange_page)
+            })
+            .item(Page::Gallery, res::str::nav_gallery(), move || {
+                page(gallery.clone(), gallery_page)
             })
             .id(day::id!(nav))
             .grow(Dimension::Both),
@@ -455,4 +549,160 @@ fn exchange_page(s: Scene) -> impl Piece {
             .id(day::id!(import_json)),
     ))
     .spacing(12.0)
+}
+
+/// Eager against lazy, side by side: the same pictures in two tables, one list at a time,
+/// with the counters that tell them apart.
+fn gallery_page(s: Scene) -> impl Piece {
+    s.refresh_gallery_count();
+    let seed = s.clone();
+    let download = s.clone();
+    let reset = s.clone();
+    let stats = s.db.clone();
+    let memo = s.db.clone();
+    let eager_bytes = s.db.clone();
+    let eager = s.db.clone();
+    let lazy_db = s.db.clone();
+    let lazy = s.gallery_lazy;
+    let statements = s.statements;
+    let count = s.gallery_count;
+    column((
+        label(res::str::gallery_help()).max_width(640.0),
+        row((
+            button(res::str::seed_generated())
+                .action(move || seed.seed_generated())
+                .id(day::id!(seed_generated)),
+            button(res::str::seed_download())
+                .action(move || download.seed_download())
+                .id(day::id!(seed_download)),
+            button(res::str::reset_counters())
+                .action(move || reset.statements.set(0))
+                .id(day::id!(reset_counters)),
+        ))
+        .spacing(8.0),
+        labeled(
+            res::str::gallery_count(),
+            label(move || count.get())
+                .id(day::id!(gallery_count))
+                .a11y(|a| a.label(res::str::gallery_count().format())),
+        ),
+        labeled(
+            res::str::gallery_lazy(),
+            toggle(lazy)
+                .id(day::id!(gallery_lazy))
+                .a11y(|a| a.label(res::str::gallery_lazy().format())),
+        ),
+        labeled(
+            res::str::gallery_statements(),
+            label(move || statements.get().to_string())
+                .id(day::id!(gallery_statements))
+                .a11y(|a| a.label(res::str::gallery_statements().format())),
+        ),
+        labeled(
+            res::str::gallery_resident(),
+            label(move || {
+                // Re-read after every statement: a fault or a flush changes what is resident.
+                statements.track();
+                let db = stats.borrow();
+                format!(
+                    "{} / {}",
+                    db.container.cache::<Photo>().with_untracked(|k| k.len()),
+                    db.container
+                        .cache::<LazyPhoto>()
+                        .with_untracked(|k| k.len())
+                )
+            })
+            .id(day::id!(gallery_resident))
+            .a11y(|a| a.label(res::str::gallery_resident().format())),
+        ),
+        labeled(
+            res::str::gallery_eager_bytes(),
+            label(move || {
+                statements.track();
+                let db = eager_bytes.borrow();
+                res::str::gallery_kib((db.eager_resident_bytes() / 1024) as i64).format()
+            })
+            .id(day::id!(gallery_eager_bytes))
+            .a11y(|a| a.label(res::str::gallery_eager_bytes().format())),
+        ),
+        labeled(
+            res::str::gallery_memo(),
+            label(move || {
+                statements.track();
+                let db = memo.borrow();
+                res::str::gallery_memo_value(res::str::GalleryMemoValue {
+                    kib: (db.container.blob_cache_bytes() / 1024) as i64,
+                    count: db.container.blob_cache_len() as i64,
+                })
+                .format()
+            })
+            .id(day::id!(gallery_memo))
+            .a11y(|a| a.label(res::str::gallery_memo().format())),
+        ),
+        when(move || lazy.get(), move || lazy_gallery(lazy_db.clone()))
+            .otherwise(move || eager_gallery(eager.clone())),
+    ))
+    .spacing(10.0)
+}
+
+/// The lazy table: a row fault reads the title and size, and the picture's bytes come from
+/// the blob column when the row is shown, through the memo once seen.
+fn lazy_gallery(db: Rc<RefCell<Database>>) -> impl Piece {
+    let query = db
+        .borrow()
+        .container
+        .query::<LazyPhoto>()
+        .sort(Sort::asc("id"))
+        .live();
+    column((
+        label(res::str::gallery_lazy_title()).font(Font::Headline),
+        list(query, |slot: ModelSlot<LazyPhoto>| {
+            row((
+                image(move || ImageSource::Bytes(slot.bytes().bytes().unwrap_or_default()))
+                    .frame(64.0, 64.0),
+                column((
+                    label(move || slot.title().read()),
+                    label(move || format!("{} bytes", slot.size_bytes().read()))
+                        .font(Font::Footnote)
+                        .secondary(),
+                ))
+                .spacing(2.0),
+            ))
+            .spacing(12.0)
+        })
+        .row_height(RowHeight::Uniform(76.0))
+        .id(day::id!(gallery_list_lazy))
+        .height(440.0),
+    ))
+    .spacing(8.0)
+}
+
+/// The eager table: every faulted row carries its picture, so scrolling costs the bytes.
+fn eager_gallery(db: Rc<RefCell<Database>>) -> impl Piece {
+    let query = db
+        .borrow()
+        .container
+        .query::<Photo>()
+        .sort(Sort::asc("id"))
+        .live();
+    column((
+        label(res::str::gallery_eager_title()).font(Font::Headline),
+        list(query, |slot: ModelSlot<Photo>| {
+            row((
+                image(move || ImageSource::Bytes(Arc::new(slot.bytes().read()))).frame(64.0, 64.0),
+                column((
+                    label(move || slot.title().read()),
+                    label(move || format!("{} bytes", slot.size_bytes().read()))
+                        .font(Font::Footnote)
+                        .secondary(),
+                ))
+                .spacing(2.0),
+            ))
+            .spacing(12.0)
+        })
+        .row_height(RowHeight::Uniform(76.0))
+        .id(day::id!(gallery_list_eager))
+        .height(440.0),
+    ))
+    .spacing(8.0)
 }

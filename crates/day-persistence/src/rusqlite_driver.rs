@@ -324,13 +324,23 @@ pub struct RusqliteConn {
     conn: Connection,
     /// Keeps the installed trace closure alive as long as the engine may call it (the box's
     /// heap address is what `sqlite3_trace_v2` holds). Dropped after `conn` closes.
-    _trace: Option<Box<TraceFn>>,
+    _trace: Option<Box<TraceCtx>>,
+}
+
+/// What the engine's trace callback carries: the sink, and the statement run it last
+/// reported, so a foreign-key action frame (which arrives as the firing statement again,
+/// with no comment of its own) is not reported as a second execution.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+struct TraceCtx {
+    f: TraceFn,
+    /// (statement handle, `SQLITE_STMTSTATUS_VM_STEP` count) of the last reported run.
+    last: std::cell::Cell<(usize, i32)>,
 }
 
 /// Install the engine's per-statement trace on a raw connection handle. rusqlite's own
 /// `trace_v2` takes a plain fn pointer, so the closure rides the C-level context instead.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn install_sql_trace(conn: &Connection, f: TraceFn) -> Box<TraceFn> {
+fn install_sql_trace(conn: &Connection, f: TraceFn) -> Box<TraceCtx> {
     use rusqlite::ffi;
     unsafe extern "C" fn cb(
         ev: std::ffi::c_uint,
@@ -341,28 +351,59 @@ fn install_sql_trace(conn: &Connection, f: TraceFn) -> Box<TraceFn> {
         if ev != ffi::SQLITE_TRACE_STMT || ctx.is_null() {
             return 0;
         }
-        // SAFETY: ctx is the connection's boxed trace closure (returned below and stored on
+        // SAFETY: ctx is the connection's boxed trace context (returned below and stored on
         // RusqliteConn), alive until after the connection closes; day's connections are
-        // single-threaded, so the callback never races the closure.
-        let f = unsafe { &*(ctx as *const TraceFn) };
+        // single-threaded, so the callback never races it.
+        let ctx = unsafe { &*(ctx as *const TraceCtx) };
+        let f = &ctx.f;
         unsafe {
+            // A trigger frame announces itself as an SQL comment (`-- TRIGGER name`) in `x`,
+            // and `p` is still the statement that fired it: expanding `p` there would report
+            // the firing statement a second time, once per trigger, which read as a row
+            // written twice. The comment is what the engine means, so it is what the sink
+            // gets.
+            let unexpanded = (!x.is_null())
+                .then(|| std::ffi::CStr::from_ptr(x.cast()).to_str().ok())
+                .flatten();
+            if let Some(comment) = unexpanded.filter(|s| s.starts_with("--")) {
+                f(comment);
+                return 0;
+            }
+            // A foreign-key action (`ON DELETE CASCADE`, `SET NULL`) is an unnamed trigger
+            // frame: the engine reports it as the firing statement again, once per parent
+            // row it cascades from, with nothing in `x` to tell it apart. One statement *run* is reported
+            // once. The VM-step counter identifies a run: the engine adds a run's steps to
+            // it only when the run returns, so every frame of one run reads the same value
+            // and the next run of the same cached statement reads a larger one.
+            let run = ffi::sqlite3_stmt_status(p.cast(), ffi::SQLITE_STMTSTATUS_VM_STEP, 0);
+            let this = (p as usize, run);
+            // A statement prepared afresh can land at the address of one just finalized, with
+            // the same zero step count; its run counter is zero too (the engine bumps it after
+            // this callback), which no sub-program frame ever shows.
+            let fresh = ffi::sqlite3_stmt_status(p.cast(), ffi::SQLITE_STMTSTATUS_RUN, 0) == 0;
+            if !fresh && ctx.last.get() == this {
+                f("-- foreign-key action");
+                return 0;
+            }
+            ctx.last.set(this);
             let expanded = ffi::sqlite3_expanded_sql(p.cast());
             if !expanded.is_null() {
                 if let Ok(s) = std::ffi::CStr::from_ptr(expanded).to_str() {
                     f(s);
                 }
                 ffi::sqlite3_free(expanded.cast());
-            } else if !x.is_null() {
-                // The engine could not expand (OOM, or a trigger frame): unexpanded text.
-                if let Ok(s) = std::ffi::CStr::from_ptr(x.cast()).to_str() {
-                    f(s);
-                }
+            } else if let Some(s) = unexpanded {
+                // The engine could not expand (OOM): the unexpanded text.
+                f(s);
             }
         }
         0
     }
-    let boxed = Box::new(f);
-    let ctx = &*boxed as *const TraceFn as *mut std::ffi::c_void;
+    let boxed = Box::new(TraceCtx {
+        f,
+        last: std::cell::Cell::new((0, -1)),
+    });
+    let ctx = &*boxed as *const TraceCtx as *mut std::ffi::c_void;
     // SAFETY: the handle is this connection's own; ctx points into `boxed`, whose heap slot
     // outlives the connection via RusqliteConn::_trace.
     unsafe {

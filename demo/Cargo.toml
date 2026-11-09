@@ -26,6 +26,8 @@ name = "dayapp"
 [dependencies]
 day = { package = "day-app", version = "0.*", features = ["model"] }
 day-persistence = { version = "0.*", path = "../crates/day-persistence" }
+# The gallery downloads its sample pictures (https://daybrite.dev/docs/http).
+day-part-http = "0.*"
 # JSON is the portable typed-record exchange format.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

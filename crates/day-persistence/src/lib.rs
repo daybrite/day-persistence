@@ -70,6 +70,8 @@ use queries::{
     CompileErr, FtsSql, RelSql, SqlIndex, compile_count, compile_fallback, compile_fetch,
 };
 
+mod blob;
+pub use blob::{Blob, BlobField, BlobReader};
 mod relations;
 pub use relations::{
     DeleteRule, Many, One, Registrar, RelationDef, RelationRef, wire_join, wire_to_many,
@@ -786,6 +788,9 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub indexed: bool,
+    /// A [`Blob`] column: never read by a row fault, written only when it carries pending
+    /// bytes, served on demand through the field's accessor.
+    pub lazy: bool,
 }
 
 /// The column pair a `#[model(spatial(lat = …, lon = …))]` declaration names.
@@ -874,6 +879,14 @@ pub trait Model: Identified + day_model::ApplyField + Clone + 'static {
     /// equals this row's `local` column, with no foreign key: the shape that reaches across an
     /// attached database (see [`ModelContainer::attach_database`]).
     const LINKS: &'static [LinkDef] = &[];
+    /// The fields declared as [`Blob`]: the columns a fault names as `NULL` and the fold
+    /// writes only when they carry pending bytes.
+    const LAZY_FIELDS: &'static [&'static str] = &[];
+    /// After a flush wrote this row: hand over every lazy field's pending bytes and mark
+    /// them stored. The derive generates it for models with [`Blob`] fields.
+    fn settle_lazy(&mut self) -> Vec<(&'static str, std::sync::Arc<Vec<u8>>)> {
+        Vec::new()
+    }
     /// Declared `external = "alias"`: the table belongs to a database attached under that alias
     /// and managed elsewhere. The container creates, migrates, and fingerprints nothing for
     /// it, and treats it as read-only.
@@ -1025,6 +1038,7 @@ pub struct Schema {
 
 type Installer = Box<dyn FnOnce(&ModelContainer) -> Result<(), DbError>>;
 /// Decode raw rows into the cache silently, answering their handles.
+type SettleFn = Rc<dyn Fn(&[u64]) -> Vec<(u64, &'static str, std::sync::Arc<Vec<u8>>)>>;
 type AbsorbFn = Rc<dyn Fn(Vec<Vec<Value>>) -> Result<Vec<u64>, DbError>>;
 /// Diff raw rows (selected by the resident keys) against the cache: per-field announcements
 /// authored [`ModelContainer::EXTERNAL_AUTHOR`], resident rows missing from the input deleted
@@ -1279,6 +1293,12 @@ pub(crate) struct TableHooks {
     pub(crate) column_names: Vec<&'static str>,
     /// Same order as `columns`; what a change's label matches against.
     pub(crate) fields: Vec<String>,
+    /// Per column, whether it is a [`Blob`]: named as `NULL` in a row select, protected by
+    /// `COALESCE` in the upsert, skipped by an update that carries no bytes for it.
+    pub(crate) lazy: Vec<bool>,
+    /// After a flush wrote these rows: settle their lazy fields to stored and return the
+    /// pending bytes they carried, for the blob memo.
+    pub(crate) settle: SettleFn,
     /// The FTS5 shadow's table name, when the model declares `fts(…)`.
     pub(crate) fts: Option<String>,
     pub(crate) fts_key: &'static str,
@@ -1463,6 +1483,9 @@ pub(crate) struct ContainerInner {
     cache_limit: Cell<usize>,
     /// Retry eviction after growth when dirty/observed rows prevent reaching the limit.
     eviction_retry: RefCell<HashMap<u64, usize>>,
+    /// Bytes of lazy blob columns read or written recently, bounded by `blob_cache_limit`.
+    blob_memo: RefCell<blob::BlobMemo>,
+    blob_cache_limit: Cell<usize>,
     /// The last autosave failure, observable by the UI (`when(container.last_error()…)`).
     pub(crate) error: day_reactive::Signal<Option<String>>,
     /// Guards re-entrant flushes (a turn-end firing during an explicit save).
@@ -1478,6 +1501,10 @@ pub struct ModelContainer {
 
 /// The default per-table bound on resident rows ([`ModelContainer::set_cache_limit`]).
 pub const DEFAULT_CACHE_LIMIT: usize = 8_192;
+
+/// How many bytes of lazy [`Blob`] values a container keeps in memory by default (32 MiB):
+/// the memo behind [`BlobField::bytes`], bounded in bytes rather than rows.
+pub const DEFAULT_BLOB_CACHE_LIMIT: usize = 32 * 1024 * 1024;
 
 impl ModelContainer {
     /// Open through `driver`, migrate, and attach every model in `schema`. Attaching creates
@@ -1525,6 +1552,8 @@ impl ModelContainer {
                 refresh_scope: RefCell::new(Refresh::None),
                 cache_limit: Cell::new(DEFAULT_CACHE_LIMIT),
                 eviction_retry: RefCell::new(HashMap::new()),
+                blob_memo: RefCell::new(blob::BlobMemo::default()),
+                blob_cache_limit: Cell::new(DEFAULT_BLOB_CACHE_LIMIT),
                 error,
                 flushing: Cell::new(false),
             }),
@@ -1599,6 +1628,228 @@ impl ModelContainer {
         for id in store_ids {
             self.enforce_cache_limit(id, &[], true);
         }
+    }
+
+    // --- lazy blobs (blob.rs) ------------------------------------------------------------
+
+    /// Bound, in bytes, on the lazy [`Blob`] values kept in memory after a read or a flush
+    /// (default [`DEFAULT_BLOB_CACHE_LIMIT`]). Lowering it releases the oldest entries now;
+    /// a value larger than the limit is served but never kept.
+    pub fn set_blob_cache_limit(&self, bytes: usize) {
+        self.inner.blob_cache_limit.set(bytes);
+        let mut memo = self.inner.blob_memo.borrow_mut();
+        if bytes == 0 {
+            memo.clear();
+        } else {
+            // Re-inserting nothing: the memo trims itself on the next insert, so trim here by
+            // inserting an empty value under a key no row has, then forgetting it.
+            memo.insert(
+                (u64::MAX, u64::MAX, ""),
+                std::sync::Arc::new(Vec::new()),
+                bytes,
+            );
+            memo.forget_row(u64::MAX, u64::MAX);
+        }
+    }
+
+    /// Bytes the blob memo currently holds.
+    pub fn blob_cache_bytes(&self) -> usize {
+        self.inner.blob_memo.borrow().bytes()
+    }
+
+    /// Values the blob memo currently holds.
+    pub fn blob_cache_len(&self) -> usize {
+        self.inner.blob_memo.borrow().len()
+    }
+
+    /// After a successful flush: settle every written row's lazy fields (pending → stored),
+    /// keep the bytes they carried in the memo, and drop the memo of every deleted row.
+    fn settle_blobs(&self, dirty: &DirtyState) {
+        let mut written: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut deleted: Vec<(u64, u64)> = Vec::new();
+        for id in &dirty.order {
+            match dirty.rows.get(id) {
+                Some(DirtyRow::Delete) => deleted.push(*id),
+                Some(_) => written.entry(id.0).or_default().push(id.1),
+                None => {}
+            }
+        }
+        for store in &dirty.full {
+            let keys = {
+                let tables = self.inner.tables.borrow();
+                tables
+                    .get(store)
+                    .map(|h| (h.resident_keys)())
+                    .unwrap_or_default()
+            };
+            written.entry(*store).or_default().extend(keys);
+        }
+        let limit = self.inner.blob_cache_limit.get();
+        for (store, keys) in written {
+            let settle = {
+                let tables = self.inner.tables.borrow();
+                match tables.get(&store) {
+                    Some(h) if h.lazy.iter().any(|l| *l) => h.settle.clone(),
+                    _ => continue,
+                }
+            };
+            for (key, field, bytes) in settle(&keys) {
+                self.inner
+                    .blob_memo
+                    .borrow_mut()
+                    .insert((store, key, field), bytes, limit);
+            }
+        }
+        if !deleted.is_empty() {
+            let mut memo = self.inner.blob_memo.borrow_mut();
+            for (store, key) in deleted {
+                memo.forget_row(store, key);
+            }
+        }
+    }
+
+    /// The SQL half of a lazy read: the table, the key clause and the stored column name.
+    fn blob_target(
+        &self,
+        store: u64,
+        key: u64,
+        column: &str,
+    ) -> Option<(String, String, Vec<Value>)> {
+        let tables = self.inner.tables.borrow();
+        let hooks = tables.get(&store)?;
+        let (clause, params) = (hooks.key_where)(key);
+        Some((
+            hooks.name.sql(),
+            format!("{} FROM {} WHERE {clause}", ident(column), hooks.name.sql()),
+            params,
+        ))
+    }
+
+    /// The whole value of a lazy column, from the memo or one point `SELECT`. Pending writes
+    /// flush first with autosave, like every other read.
+    pub(crate) fn blob_bytes(
+        &self,
+        store: u64,
+        key: u64,
+        column: &'static str,
+    ) -> Result<std::sync::Arc<Vec<u8>>, DbError> {
+        if self.inner.autosave.get() && !self.inner.dirty.borrow().is_empty() {
+            self.save()?;
+        }
+        if let Some(hit) = self.inner.blob_memo.borrow_mut().get((store, key, column)) {
+            return Ok(hit);
+        }
+        let Some((_, tail, params)) = self.blob_target(store, key, column) else {
+            return Ok(std::sync::Arc::new(Vec::new()));
+        };
+        let mut bytes = Vec::new();
+        self.conn()
+            .query(&format!("SELECT {tail}"), &params, &mut |row| {
+                bytes = row.get(0).as_blob().map(|b| b.to_vec()).unwrap_or_default();
+            })?;
+        let bytes = std::sync::Arc::new(bytes);
+        let limit = self.inner.blob_cache_limit.get();
+        self.inner
+            .blob_memo
+            .borrow_mut()
+            .insert((store, key, column), bytes.clone(), limit);
+        Ok(bytes)
+    }
+
+    /// `length(col)`: the value's size without reading it (the memo answers when it can).
+    pub(crate) fn blob_len(
+        &self,
+        store: u64,
+        key: u64,
+        column: &'static str,
+    ) -> Result<usize, DbError> {
+        if self.inner.autosave.get() && !self.inner.dirty.borrow().is_empty() {
+            self.save()?;
+        }
+        if let Some(hit) = self.inner.blob_memo.borrow_mut().get((store, key, column)) {
+            return Ok(hit.len());
+        }
+        let Some((table, _, params)) = self.blob_target(store, key, column) else {
+            return Ok(0);
+        };
+        let clause = {
+            let tables = self.inner.tables.borrow();
+            tables
+                .get(&store)
+                .map(|h| (h.key_where)(key).0)
+                .unwrap_or_default()
+        };
+        let mut len = 0usize;
+        self.conn().query(
+            &format!(
+                "SELECT length({}) FROM {table} WHERE {clause}",
+                ident(column)
+            ),
+            &params,
+            &mut |row| len = row.get(0).as_int().unwrap_or(0).max(0) as usize,
+        )?;
+        Ok(len)
+    }
+
+    /// `substr(col, start + 1, len)`: one range of the value, clamped to its length, so only
+    /// the asked-for bytes cross from the engine.
+    pub(crate) fn blob_range(
+        &self,
+        store: u64,
+        key: u64,
+        column: &'static str,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<u8>, DbError> {
+        if self.inner.autosave.get() && !self.inner.dirty.borrow().is_empty() {
+            self.save()?;
+        }
+        if let Some(hit) = self.inner.blob_memo.borrow_mut().get((store, key, column)) {
+            let start = range.start.min(hit.len());
+            let end = range.end.clamp(start, hit.len());
+            return Ok(hit[start..end].to_vec());
+        }
+        if range.end <= range.start {
+            return Ok(Vec::new());
+        }
+        let Some((table, _, mut params)) = self.blob_target(store, key, column) else {
+            return Ok(Vec::new());
+        };
+        let clause = {
+            let tables = self.inner.tables.borrow();
+            tables
+                .get(&store)
+                .map(|h| (h.key_where)(key).0)
+                .unwrap_or_default()
+        };
+        let mut all = vec![
+            Value::Int(range.start as i64 + 1),
+            Value::Int((range.end - range.start) as i64),
+        ];
+        all.append(&mut params);
+        let mut bytes = Vec::new();
+        self.conn().query(
+            &format!(
+                "SELECT substr({}, ?, ?) FROM {table} WHERE {clause}",
+                ident(column)
+            ),
+            &all,
+            &mut |row| bytes = row.get(0).as_blob().map(|b| b.to_vec()).unwrap_or_default(),
+        )?;
+        Ok(bytes)
+    }
+
+    /// Drop the memo of one row's lazy values (the row left).
+    #[allow(dead_code)]
+    pub(crate) fn blob_forget(&self, store: u64, key: u64) {
+        self.inner.blob_memo.borrow_mut().forget_row(store, key);
+    }
+
+    /// Drop the memo of one lazy value (a write replaced it).
+    pub(crate) fn blob_forget_field(&self, store: u64, key: u64, column: &'static str) {
+        self.inner
+            .blob_memo
+            .borrow_mut()
+            .forget_one((store, key, column));
     }
 
     /// Install one transaction extension before exposing the container to writers. Registration
@@ -1723,6 +1974,17 @@ impl ModelContainer {
             Ok(stmts) => {
                 // Previously dirty rows can now be evicted on the next fault.
                 self.inner.eviction_retry.borrow_mut().clear();
+                // And a pass runs now for every store the flush touched: an import that only
+                // inserts never faults, so without this every row it wrote would stay
+                // resident, however far past the limit (a ten-million-row seed sat at 3 GB).
+                let mut touched: Vec<u64> = dirty.order.iter().map(|(store, _)| *store).collect();
+                touched.extend(dirty.full.iter().copied());
+                touched.sort_unstable();
+                touched.dedup();
+                for store in touched {
+                    self.enforce_cache_limit(store, &[], false);
+                }
+                self.settle_blobs(&dirty);
                 self.inner.error.set_if_changed(None);
                 self.run_deferred_requeries(stmts);
             }
@@ -1891,7 +2153,7 @@ impl ModelContainer {
             (
                 hooks.is_resident.clone(),
                 hooks.absorb.clone(),
-                column_list(&hooks.columns),
+                select_list(hooks),
                 hooks.name.sql(),
                 keys_where_of(hooks),
             )
@@ -1997,6 +2259,18 @@ impl ModelContainer {
                 .collect()
         };
         let evicted = evict(&candidates, excess);
+        if evicted > 0 {
+            let is_resident = {
+                let tables = self.inner.tables.borrow();
+                tables.get(&store_id).map(|h| h.is_resident.clone())
+            };
+            if let Some(is_resident) = is_resident {
+                let mut memo = self.inner.blob_memo.borrow_mut();
+                for key in candidates.iter().filter(|k| !is_resident(**k)) {
+                    memo.forget_row(store_id, *key);
+                }
+            }
+        }
         let remaining = resident_len.saturating_sub(evicted);
         self.inner.eviction_retry.borrow_mut().insert(
             store_id,
@@ -2301,6 +2575,28 @@ impl ModelContainer {
         }) as EvictFn;
         let watch_undo = Rc::new(move |stack: &day_model::UndoStack| stack.watch(store))
             as Rc<dyn Fn(&day_model::UndoStack)>;
+        // After a flush: the pending bytes of these rows' lazy fields are in the file, so the
+        // fields settle to stored, under the database's own author so nothing re-dirties.
+        let settle = Rc::new(move |keys: &[u64]| {
+            let mut out = Vec::new();
+            if M::LAZY_FIELDS.is_empty() {
+                return out;
+            }
+            day_model::with_author(ModelContainer::EXTERNAL_AUTHOR, || {
+                for &key in keys {
+                    let Some(mut row) = store.with_untracked(|k| k.get(key).cloned()) else {
+                        continue;
+                    };
+                    let taken = row.settle_lazy();
+                    if taken.is_empty() {
+                        continue;
+                    }
+                    store.merge_row(key, row, M::LAZY_FIELDS);
+                    out.extend(taken.into_iter().map(|(f, b)| (key, f, b)));
+                }
+            });
+            out
+        }) as SettleFn;
 
         self.inner.tables.borrow_mut().insert(
             store_id,
@@ -2312,6 +2608,8 @@ impl ModelContainer {
                 columns,
                 column_names: M::COLUMNS.iter().map(|c| c.name).collect(),
                 fields,
+                lazy: M::COLUMNS.iter().map(|c| c.lazy).collect(),
+                settle,
                 resident_len,
                 fts: (!M::FTS_COLUMNS.is_empty()).then(|| format!("{}_fts", M::TABLE)),
                 fts_key: if key_sql == SqlType::Integer {
@@ -3634,8 +3932,12 @@ impl ModelContainer {
                         let Some(i) = hooks.fields.iter().position(|n| n == c) else {
                             continue; // a transient field's label, never a column
                         };
+                        let value = row.get(i);
+                        if hooks.lazy.get(i).copied().unwrap_or(false) && value == Value::Null {
+                            continue; // a stored blob the row did not rewrite: leave the bytes
+                        }
                         sets.push(format!("{} = ?", ident(&hooks.columns[i])));
-                        set_params.push(row.get(i));
+                        set_params.push(value);
                     }
                     if set_params.is_empty() {
                         continue; // only transient fields changed
@@ -4145,17 +4447,43 @@ fn materialize(
     }
 }
 
+/// The row select list: every column, with a lazy one named as a literal `NULL` so the
+/// row's shape stays the same while the bytes stay in the file.
+fn select_list(hooks: &TableHooks) -> String {
+    hooks
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if hooks.lazy.get(i).copied().unwrap_or(false) {
+                "NULL".to_string()
+            } else {
+                ident(c)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
     let cols = column_list(&hooks.columns);
     let marks = vec!["?"; hooks.columns.len()].join(", ");
     // A true upsert, not `INSERT OR REPLACE`: the conflict path fires `UPDATE` triggers, which
     // is what keeps the generated FTS/R*Tree shadows in sync (`OR REPLACE`'s implicit delete
-    // skips `AFTER DELETE` triggers unless recursive_triggers is on).
+    // skips `AFTER DELETE` triggers unless recursive_triggers is on). A lazy column keeps its
+    // stored bytes when the row arrives without new ones (`NULL`).
     let sets = hooks
         .columns
         .iter()
-        .filter(|c| !hooks.key_cols.contains(c))
-        .map(|c| format!("{0} = excluded.{0}", ident(c)))
+        .enumerate()
+        .filter(|(_, c)| !hooks.key_cols.contains(c))
+        .map(|(i, c)| {
+            if hooks.lazy.get(i).copied().unwrap_or(false) {
+                format!("{0} = COALESCE(excluded.{0}, {0})", ident(c))
+            } else {
+                format!("{0} = excluded.{0}", ident(c))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let conflict = if sets.is_empty() {
@@ -4658,6 +4986,7 @@ impl ModelContainer {
     /// process). O(working set + query results), never O(table).
     pub fn rescan(&self) -> Result<(), DbError> {
         self.save()?;
+        self.inner.blob_memo.borrow_mut().clear();
         self.refresh_resident()?;
         self.invalidate_relation_memos();
         self.requery_all();
@@ -4735,6 +5064,7 @@ impl ModelContainer {
         if !self.inner.dirty.borrow().is_empty() {
             self.save()?;
         }
+        self.inner.blob_memo.borrow_mut().clear();
         type Doomed = Vec<(Rc<dyn Fn() -> Vec<u64>>, EvictFn)>;
         let doomed: Doomed = self
             .inner
@@ -4815,6 +5145,7 @@ impl ModelContainer {
     /// [`ModelContainer::refresh_resident`] over the tables named (all of them for `None`).
     fn refresh_resident_in(&self, only: Option<&[&'static str]>) -> Result<bool, DbError> {
         struct RefreshJob {
+            store: u64,
             resident_keys: Rc<dyn Fn() -> Vec<u64>>,
             refresh: RefreshFn,
             columns: String,
@@ -4824,12 +5155,13 @@ impl ModelContainer {
         let jobs: Vec<RefreshJob> = {
             let tables = self.inner.tables.borrow();
             tables
-                .values()
-                .filter(|h| only.is_none_or(|t| t.contains(&h.table)))
-                .map(|h| RefreshJob {
+                .iter()
+                .filter(|(_, h)| only.is_none_or(|t| t.contains(&h.table)))
+                .map(|(store, h)| RefreshJob {
+                    store: *store,
                     resident_keys: h.resident_keys.clone(),
                     refresh: h.refresh.clone(),
-                    columns: column_list(&h.columns),
+                    columns: select_list(h),
                     table: h.name.sql(),
                     keys_where: keys_where_of(h),
                 })
@@ -4837,6 +5169,7 @@ impl ModelContainer {
         };
         let mut changed = false;
         for RefreshJob {
+            store,
             resident_keys,
             refresh,
             columns,
@@ -4844,6 +5177,8 @@ impl ModelContainer {
             keys_where,
         } in jobs
         {
+            // Another writer may have replaced the bytes; the memo answers from the file next.
+            self.inner.blob_memo.borrow_mut().forget_store(store);
             let resident = resident_keys();
             if resident.is_empty() {
                 continue;

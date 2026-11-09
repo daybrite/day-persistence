@@ -108,3 +108,14 @@ flow:
   - assert_text: { id: record_count, text: "1" }
   - tap: { id: delete_note }
   - assert_text: { id: record_count, text: "0" }
+
+  # The gallery: the same pictures eager and lazy. The generated seed keeps CI off the network.
+  - navigate: { route: gallery }
+  - tap: { id: seed_generated }
+  - assert_text: { id: gallery_count, text: "120" }
+  - wait_for: { id: gallery_list_lazy }
+  - screenshot: gallery-lazy
+  - toggle: { id: gallery_lazy, value: false }
+  - wait_for: { id: gallery_list_eager }
+  - screenshot: gallery-eager
+  - a11y_audit: {}

@@ -67,6 +67,9 @@ struct FieldDef {
     transient: bool,
     with: Option<String>,
     json: bool,
+    /// A `Blob` field: a lazy BLOB column, never read by a row fault, written only when it
+    /// carries pending bytes (docs/persistence.md, "Lazy blob columns").
+    lazy: bool,
     /// `#[model(relation(…))]`: a `Many<T>` marker field. It gets no column or plain accessor;
     /// the Model derive emits a `RelationRef` accessor and the wiring instead.
     relation: Option<RelationAttr>,
@@ -194,7 +197,44 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         Some(alias) => format!("{alias}.{bare_table}"),
         None => bare_table.clone(),
     };
-    let persisted: Vec<&FieldDef> = def.fields.iter().filter(|f| f.persisted()).collect();
+    for f in def.fields.iter().filter(|f| f.lazy) {
+        if f.key {
+            return Err(format!(
+                "Model: `{name}`'s id field `{}` cannot be a Blob",
+                f.name
+            ));
+        }
+        if f.with.is_some() || f.json {
+            return Err(format!(
+                "Model: Blob field `{}` of `{name}` takes no codec; it is stored as it is",
+                f.name
+            ));
+        }
+        if !f.persisted() {
+            return Err(format!(
+                "Model: Blob field `{}` of `{name}` cannot be transient or a relation marker",
+                f.name
+            ));
+        }
+    }
+    if let Some(f) = def.fields.iter().find(|f| {
+        f.nullable() && is_blob_type(f.ty.trim_start_matches("Option <").trim_end_matches('>'))
+    }) {
+        return Err(format!(
+            "Model: field `{}` of `{name}` is `Option<Blob>`; a Blob column is nullable by \
+             itself (a NULL reads as empty), so declare it as `Blob`",
+            f.name
+        ));
+    }
+    // Lazy columns go last in the table: SQLite keeps a large value in an overflow chain, and
+    // a select that stops at an earlier column never reads it. COLUMNS, to_row and from_row
+    // all follow this order, so the struct's field order is free.
+    let persisted: Vec<&FieldDef> = def
+        .fields
+        .iter()
+        .filter(|f| f.persisted() && !f.lazy)
+        .chain(def.fields.iter().filter(|f| f.persisted() && f.lazy))
+        .collect();
     for f in def.fields.iter().filter(|f| f.link.is_some()) {
         let l = f.link.as_ref().expect("filtered");
         if !persisted.iter().any(|p| p.column_name() == l.local) {
@@ -231,12 +271,13 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         let sql = sql_type_expr(f);
         columns.push_str(&format!(
             "        day_persistence::ColumnDef {{ name: {:?}, field: \"{}\", sql: {sql}, \
-             not_null: {}, unique: {}, indexed: {} }},\n",
+             not_null: {}, unique: {}, indexed: {}, lazy: {} }},\n",
             f.column_name(),
             f.name,
-            !f.nullable(),
+            !f.nullable() && !f.lazy,
             f.unique,
             f.indexed,
+            f.lazy,
         ));
     }
 
@@ -487,6 +528,31 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         ),
     };
 
+    let lazy_fields: Vec<&FieldDef> = persisted.iter().copied().filter(|f| f.lazy).collect();
+    let lazy_const = if lazy_fields.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "    const LAZY_FIELDS: &'static [&'static str] = &[{}];\n\
+             \x20   fn settle_lazy(&mut self) -> Vec<(&'static str, ::std::sync::Arc<Vec<u8>>)> {{\n\
+             \x20       let mut out = Vec::new();\n{}\
+             \x20       out\n\
+             \x20   }}\n",
+            lazy_fields
+                .iter()
+                .map(|f| format!("\"{}\"", f.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            lazy_fields
+                .iter()
+                .map(|f| format!(
+                    "        if let Some(b) = self.{}.take_pending() {{ out.push((\"{}\", b)); }}\n",
+                    f.name, f.name
+                ))
+                .collect::<String>(),
+        )
+    };
+
     let key_sql = sql_type_expr(key);
     Ok(col_impl
         + &rel_trait
@@ -497,7 +563,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
          \x20   const KEY_SQL: day_persistence::SqlType = {key_sql};\n\
          \x20   const COLUMNS: &'static [day_persistence::ColumnDef] = &[\n{columns}    ];\n\
          \x20   const COMPOSITE_INDEXES: &'static [&'static [&'static str]] = &[{composites}];\n\
-         {fts_const}{spatial_const}{relations_const}{links_const}{external_const}\
+         {fts_const}{spatial_const}{relations_const}{links_const}{external_const}{lazy_const}\
          \x20   fn to_row(&self) -> Vec<day_persistence::Value> {{\n\
          \x20       vec![\n{to_row}        ]\n\
          \x20   }}\n\
@@ -1104,6 +1170,12 @@ fn parse_fields(body: TokenStream) -> Result<Vec<FieldDef>, String> {
     Ok(fields)
 }
 
+/// Whether a field's type text is `Blob` (bare or path-qualified), the lazy column type.
+fn is_blob_type(ty: &str) -> bool {
+    let last = ty.rsplit("::").next().unwrap_or(ty).trim();
+    last == "Blob"
+}
+
 fn parse_one(chunk: &[TokenTree]) -> Result<FieldDef, String> {
     let mut i = 0;
     let mut f = FieldDef::default();
@@ -1164,11 +1236,13 @@ fn parse_one(chunk: &[TokenTree]) -> Result<FieldDef, String> {
         _ => return Err(format!("expected `:` after field `{}`", f.name)),
     }
 
-    // The type is whatever is left, re-emitted verbatim, never interpreted.
+    // The type is whatever is left, re-emitted verbatim, never interpreted, except that the
+    // one type the schema half treats specially, `Blob`, is recognised by its last segment.
     f.ty = tokens_text(&chunk[i..]);
     if f.ty.is_empty() {
         return Err(format!("field `{}` has no type", f.name));
     }
+    f.lazy = is_blob_type(&f.ty);
 
     for items in deferred {
         parse_field_options(items, &mut f)?;

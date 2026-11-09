@@ -57,3 +57,37 @@ fn a_large_dirty_transaction_amortizes_eviction_scans() {
         assert!(c.try_get::<Fixture>(id).unwrap().unwrap().value().peek());
     }
 }
+
+/// An import inserts and saves and never faults, so the pass that trims the cache must run
+/// at the flush itself: the rows it just wrote are clean and in the file, and a ten-million
+/// row seed should run in the memory of its batch.
+#[test]
+fn a_bulk_insert_is_trimmed_at_save() {
+    let c = ModelContainer::open(Sqlite::memory(), schema![Fixture]).unwrap();
+    c.set_autosave(false);
+    c.set_cache_limit(256);
+    for id in 1..=4096 {
+        c.insert(Fixture { id, value: false });
+    }
+    let store = c.cache::<Fixture>();
+    assert_eq!(
+        store.with_untracked(|k| k.len()),
+        4096,
+        "dirty rows are pinned until the flush"
+    );
+    c.save().unwrap();
+    let resident = store.with_untracked(|k| k.len());
+    assert!(
+        resident <= 256 + 64,
+        "the flush released the pins and trimmed the cache: {resident} resident"
+    );
+    // Trimmed, not lost: the rows fault back from the file.
+    assert!(
+        !c.try_get::<Fixture>(4096u64)
+            .unwrap()
+            .unwrap()
+            .value()
+            .peek()
+    );
+    assert_eq!(c.table_count::<Fixture>().unwrap(), 4096);
+}

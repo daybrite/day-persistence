@@ -32,6 +32,7 @@ impl Model for Note {
             not_null: true,
             unique: false,
             indexed: false,
+            lazy: false,
         },
         ColumnDef {
             name: "title",
@@ -40,6 +41,7 @@ impl Model for Note {
             not_null: true,
             unique: false,
             indexed: false,
+            lazy: false,
         },
         ColumnDef {
             name: "body",
@@ -48,6 +50,7 @@ impl Model for Note {
             not_null: true,
             unique: false,
             indexed: false,
+            lazy: false,
         },
         ColumnDef {
             name: "pinned",
@@ -56,6 +59,7 @@ impl Model for Note {
             not_null: true,
             unique: false,
             indexed: false,
+            lazy: false,
         },
     ];
     fn to_row(&self) -> Vec<Value> {
@@ -403,6 +407,7 @@ fn fingerprints_answer_to_every_declared_detail() {
                 not_null: true,
                 unique: false,
                 indexed: false,
+                lazy: false,
             },
             ColumnDef {
                 name: "title",
@@ -411,6 +416,7 @@ fn fingerprints_answer_to_every_declared_detail() {
                 not_null: true,
                 unique: false,
                 indexed: false,
+                lazy: false,
             },
         ];
         fn to_row(&self) -> Vec<Value> {

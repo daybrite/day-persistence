@@ -877,9 +877,9 @@ fn a_self_referential_cascade_flushes_as_one_statement() {
 }
 
 #[test]
-fn the_engines_own_cascade_re_logs_the_parent_statement() {
-    // Diagnosing a report of "the same DELETE five times" in a trace. Two things are going
-    // on, and only one of them is real work.
+fn the_engines_own_cascade_is_traced_as_frames() {
+    // Diagnosing a report of "the same DELETE five times" in a trace: the fold wrote one
+    // statement, and the engine's cascade inside it must not read as four more.
     let path = temp_db("trace-cascade");
     let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
     let sink = seen.clone();
@@ -922,27 +922,30 @@ fn the_engines_own_cascade_re_logs_the_parent_statement() {
     // The fold writes one statement for the whole subtree; no row is written twice.
     assert_eq!(folded.len(), 1, "{folded:?}");
 
-    // The trace shows more, because SQLite re-enters the trace for each sub-program its own
-    // `ON DELETE CASCADE` runs, and reports the top-level statement's text each time. The
-    // parent's DELETE therefore appears once per cascaded child plus once for itself.
-    assert!(
-        traced.len() > folded.len(),
-        "the engine's cascade re-logs the parent: traced {traced:?}"
-    );
-    // Compare on the expanded text: the fold's statement carries a `?`, the trace carries
-    // the bound value.
-    // …but the trace still shows more than one line for it, because SQLite re-enters the
-    // trace for each sub-program its own `ON DELETE CASCADE` runs and reports the top-level
-    // statement's text each time. Reading a trace, that looks like repetition; it is one
-    // statement doing the work the FK clause asked for.
-    assert!(
-        traced.len() > folded.len(),
-        "the engine's cascade re-logs the statement: {traced:?}"
+    // The engine's own `ON DELETE CASCADE` runs once per child inside that statement. The
+    // trace reports the statement once, and each cascaded row as a foreign-key-action frame,
+    // so a reader counting DELETE lines counts statements, not rows.
+    assert_eq!(
+        traced.len(),
+        folded.len(),
+        "the parent's DELETE is traced once: {traced:?}"
     );
     let parent_hex = format!("x'{}'", hex(ids[0].as_bytes()));
     assert!(
-        traced.iter().all(|s| s.contains(&parent_hex)),
-        "every line is the same batched statement: {traced:?}"
+        traced[0].contains(&parent_hex),
+        "the traced line is the batched statement with its values expanded: {traced:?}"
+    );
+    let frames = seen
+        .borrow()
+        .iter()
+        .filter(|s| *s == "-- foreign-key action")
+        .count();
+    // One action program per deleted parent row (the root's takes all four children, then
+    // each child's runs for its own, empty, subtree): frames, never the DELETE again.
+    assert!(
+        frames >= 1,
+        "the cascade is reported as foreign-key-action frames: {:?}",
+        seen.borrow()
     );
     let _ = std::fs::remove_file(&path);
 }

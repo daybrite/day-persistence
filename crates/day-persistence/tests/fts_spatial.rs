@@ -647,8 +647,11 @@ fn updating_a_non_indexed_column_leaves_the_fts_index_untouched() {
             .any(|s| s.starts_with("UPDATE \"posts\" SET \"done\"")),
         "{flag_statements:?}"
     );
+    // The trace names a trigger frame as `-- TRIGGER …` even when its WHEN clause then
+    // declines; what must not appear is a statement that writes the shadow.
+    let fts_write = |s: &String| !s.starts_with("-- TRIGGER") && s.contains("posts_fts");
     assert!(
-        !flag_statements.iter().any(|s| s.contains("posts_fts")),
+        !flag_statements.iter().any(fts_write),
         "no FTS statement ran for a non-indexed update: {flag_statements:?}"
     );
     // …and a same-value assignment to an indexed column, as another tool might write it…
@@ -656,10 +659,7 @@ fn updating_a_non_indexed_column_leaves_the_fts_index_untouched() {
     c.with_connection(|conn| conn.execute("UPDATE posts SET title = title WHERE id = 1", &[]))
         .expect("same-value update");
     let same_value = trace.borrow().clone();
-    assert!(
-        !same_value.iter().any(|s| s.contains("posts_fts")),
-        "{same_value:?}"
-    );
+    assert!(!same_value.iter().any(fts_write), "{same_value:?}");
     // …leave the index's storage byte-for-byte as it was, and the search still answers.
     assert_eq!(fts_segments(&c, "posts"), before);
     assert_eq!(q.ids_untracked(), [1]);

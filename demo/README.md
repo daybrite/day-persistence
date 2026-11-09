@@ -12,6 +12,10 @@ initially, so experimenting does not touch saved notes.
 - **Import / Export:** copy typed notes as JSON, edit or paste a document, and replace the note
   table. Duplicate/zero IDs and malformed JSON are rejected before mutation. Export before
   replacing data you want to keep. File exchange uses copy/paste; there is no file picker.
+- **Gallery:** the same 120 pictures stored twice, once with the bytes inline and once in a
+  lazy `Blob` column a row fault never reads. Seed with generated PNGs (offline, what the
+  dayscript uses) or download sample photos from picsum.photos, then switch the list between
+  the two tables and watch the statement count, the resident rows and the blob memo.
 
 Every page shows the **SQL log** under its controls, in a split you can resize. Each statement
 the engine runs is added as it runs, so typed edits, queries, and maintenance all show the SQL

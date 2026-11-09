@@ -781,6 +781,56 @@ Deleting either side drops its memberships; under `cascade` it also takes the ro
 join that no other row still holds, so deleting one album never takes a shared photo with it.
 `Model::RELATIONS` exposes every declaration as data, for tools and tests.
 
+## Lazy blob columns
+
+A `Blob` field is a `BLOB` column a row fault never reads. The row arrives with that column
+named as a literal `NULL` in the `SELECT`, the field decodes to `Blob::stored()`, and the
+bytes come when asked for, through the field's accessor:
+
+```rust
+#[derive(Model, Clone, Default, PartialEq)]
+#[model(table = "attachments")]
+pub struct Attachment {
+    #[model(id)] pub id: u64,
+    pub filename: String,
+    pub data: Blob,                      // nullable BLOB, placed last in the table
+}
+
+container.insert(Attachment { id, filename, data: Blob::new(bytes) });  // pending until the flush
+let a = container.get::<Attachment>(id)?;
+a.data().bytes()?            // Arc<Vec<u8>>: the memo, or one `SELECT "data" … WHERE id = ?`
+a.data().len()?              // `length("data")`, without reading the value
+a.data().read_range(0..512)? // `substr("data", 1, 512)`: only those bytes cross from the engine
+a.data().reader()            // std::io::Read over the value, 256 KiB at a time
+a.data().write_bytes(bytes); // pending until the flush, then one `UPDATE … SET "data" = ?`
+```
+
+Writes travel inside the struct: `Blob::new` holds the bytes as *pending*, and a pending
+value answers reads at once, so a write made this turn is visible before it is flushed like
+any other field. The flush writes the bytes, settles the field back to `stored` under the
+database's own author (nothing re-dirties), and parks the bytes in the memo, so the read that
+follows a save is a hit. The memo is bounded in **bytes**, not rows
+(`set_blob_cache_limit`, default `DEFAULT_BLOB_CACHE_LIMIT`, 32 MiB; `blob_cache_bytes()`
+and `blob_cache_len()` answer the settings-page question); a value larger than the limit is
+served but never kept. A row leaving the cache, a delete, an external change seen by
+`check_external`, `rescan` and `detach_database` all drop the memo entries they invalidate.
+
+The fold protects a stored value: a lazy column's upsert clause is
+`"data" = COALESCE(excluded."data", "data")`, and an `UPDATE` that carries `NULL` for a lazy
+column (the row rewrote other fields, not the bytes) leaves that column out, so a wholesale
+`Store::update`, an import, or a field edit never erases bytes the row already has. A never
+written column is `NULL` and reads as empty; `Photo::data().is_null()` tells the two apart.
+
+The column is nullable by itself (`Option<Blob>` is refused), takes no codec, cannot be the
+key, and goes **last** in a new table's DDL whatever its position in the struct: SQLite keeps
+a large value in an overflow chain, and a select that stops at an earlier column never reads
+it, so even raw `SELECT id, filename FROM attachments` stays cheap. Turning an existing
+`Vec<u8>` column into a `Blob` is a nullability change the table rebuild closes, bytes
+intact. Undo covers an unflushed blob write (the pending bytes are dropped, nothing is
+written) but not a flushed one: the history holds `stored`, which carries no bytes to
+restore. Reads stay on the owning queue like every `Elem`; a `Vec<u8>` from `bytes()`
+crosses a worker boundary freely. `tests/blob.rs` is the reference suite.
+
 ## Attached databases and links
 
 A container can hold a second SQLite file that someone else owns — a catalog an app
@@ -919,6 +969,14 @@ let driver = if cfg!(debug_assertions) {
     driver
 };
 ```
+
+Work the engine does on its own inside a statement is reported as a comment line rather
+than as a statement: a trigger body as `-- TRIGGER name`, a foreign-key action (`ON DELETE
+CASCADE`, `SET NULL`) as `-- foreign-key action`, and FTS5's shadow-table maintenance as the
+`-- …` lines SQLite itself emits. So one `INSERT` into a model with a text index is one
+statement line followed by its trigger's comment, and a parent's `DELETE` is one line however
+many rows the engine cascades; a sink that counts statements counts what the container
+issued.
 
 The trace installs after any `PRAGMA key`, so a cipher key never reaches the sink. On web-dom
 a file database's engine runs in the day-sql worker, out of closure reach: its statements log

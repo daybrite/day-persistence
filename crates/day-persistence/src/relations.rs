@@ -1291,6 +1291,18 @@ day_reactive::tls_group! {
 
 }
 
+/// The open container whose tables include `store`, for an accessor that holds only a
+/// field (a [`crate::Blob`]'s reads).
+pub(crate) fn container_for_store(store: u64) -> Option<ModelContainer> {
+    CONTAINERS.with(|c| {
+        c.borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|inner| inner.tables.borrow().contains_key(&store))
+            .map(|inner| ModelContainer { inner })
+    })
+}
+
 pub(crate) fn register_container(inner: &Rc<ContainerInner>) {
     CONTAINERS.with(|c| {
         let mut v = c.borrow_mut();
@@ -1879,6 +1891,8 @@ impl ModelContainer {
             columns,
             column_names,
             fields,
+            lazy: vec![false; if ordered { 3 } else { 2 }],
+            settle: Rc::new(|_| Vec::new()),
             fts: None,
             fts_key: "rowid",
             spatial: None,

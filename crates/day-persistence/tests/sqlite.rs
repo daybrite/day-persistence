@@ -275,3 +275,133 @@ fn trace_sql_logs_every_statement_the_engine_runs() {
         "flush logged with parameters expanded: {log:?}"
     );
 }
+
+/// Work the engine does inside a statement (a trigger body, a foreign-key action) is
+/// reported as a `-- …` comment, never as the firing statement again: an insert into a
+/// text-indexed table is one statement line, and a parent's `DELETE` is one line however
+/// many rows `ON DELETE CASCADE` takes with it.
+#[test]
+fn trace_sql_reports_engine_frames_as_comments() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Model, Clone, Default, PartialEq)]
+    #[model(table = "traced_albums", fts("title"))]
+    struct TracedAlbum {
+        #[model(id)]
+        id: u32,
+        title: String,
+        #[model(relation(target = TracedPhoto, inverse = "album", delete = "cascade"))]
+        photos: day_persistence::Many<TracedPhoto>,
+    }
+
+    #[derive(Model, Clone, Default, PartialEq)]
+    #[model(table = "traced_photos")]
+    struct TracedPhoto {
+        #[model(id)]
+        id: u32,
+        album: day_persistence::One<TracedAlbum>,
+    }
+
+    let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let driver = Sqlite::memory().trace_sql(move |sql| sink.borrow_mut().push(sql.to_string()));
+    let container = ModelContainer::open(driver, schema![TracedAlbum, TracedPhoto]).expect("open");
+    container.set_autosave(false);
+    seen.borrow_mut().clear();
+
+    container.insert(TracedAlbum {
+        id: 1,
+        title: "kyoto".into(),
+        ..Default::default()
+    });
+    container.save().expect("flush");
+    {
+        let log = seen.borrow();
+        let inserts = log
+            .iter()
+            .filter(|s| s.starts_with("INSERT INTO \"traced_albums\""))
+            .count();
+        assert_eq!(
+            inserts, 1,
+            "one upsert for one row, not one per trigger: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("-- TRIGGER traced_albums_fts_ai")),
+            "the FTS insert trigger is reported as its comment: {log:?}"
+        );
+    }
+
+    for id in 1..=3 {
+        container.insert(TracedPhoto {
+            id,
+            album: day_persistence::One::to(1u32),
+        });
+    }
+    container.save().expect("flush photos");
+    // Delete through raw SQL so the engine alone cascades, with no in-process pipeline to
+    // issue child deletes of its own.
+    seen.borrow_mut().clear();
+    container
+        .try_with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM \"traced_albums\" WHERE \"id\" = ?",
+                &[day_persistence::Value::Int(1)],
+            )
+            .map(|_| ())
+        })
+        .expect("raw delete");
+    let log = seen.borrow();
+    let deletes = log
+        .iter()
+        .filter(|s| s.starts_with("DELETE FROM \"traced_albums\""))
+        .count();
+    assert_eq!(
+        deletes, 1,
+        "the parent DELETE once, not once per cascaded row: {log:?}"
+    );
+    // The engine runs one action program per parent row it deletes (that program takes all
+    // three photos), so the cascade shows as a frame, never as the DELETE again.
+    assert!(
+        log.iter().any(|s| s == "-- foreign-key action"),
+        "the cascade is reported as a foreign-key-action frame: {log:?}"
+    );
+    // The count below is traced too, so the sink must be free to take the lock.
+    drop(log);
+    // Statements prepared afresh (`query_named` does not cache) can reuse the address of the
+    // one just finalized; each is still its own line, never mistaken for a frame of the last.
+    seen.borrow_mut().clear();
+    for n in 1..=3 {
+        container
+            .try_with_connection(|conn| {
+                conn.query_named(&format!("SELECT {n} AS fixture"), &[], &mut |_, _| {})
+            })
+            .expect("fresh statement");
+    }
+    let fresh: Vec<String> = seen
+        .borrow()
+        .iter()
+        .filter(|s| s.starts_with("SELECT"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        fresh,
+        [
+            "SELECT 1 AS fixture",
+            "SELECT 2 AS fixture",
+            "SELECT 3 AS fixture"
+        ],
+        "{:?}",
+        seen.borrow()
+    );
+    let mut left = -1;
+    container
+        .try_with_connection(|conn| {
+            conn.query("SELECT COUNT(*) FROM \"traced_photos\"", &[], &mut |row| {
+                left = row.get(0).as_int().unwrap_or(-1);
+            })
+        })
+        .expect("count");
+    assert_eq!(left, 0, "the engine did cascade");
+}

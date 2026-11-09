@@ -381,6 +381,19 @@ impl ToOneRel {
     /// The parent's children, in relation order: the memo, or one indexed `SELECT`, overlaid
     /// with this turn's unflushed dirty rows so mid-turn reads see the truth.
     pub(crate) fn children_of(&self, parent: u64) -> Vec<u64> {
+        // A parent deleted this turn has no children to show, whatever the file still holds
+        // until the flush takes them.
+        if self.with_container(|c| c.dirty_state_of(self.parent_store, parent))
+            == Some(Some(DirtyRow::Delete))
+        {
+            return Vec::new();
+        }
+        self.children_of_raw(parent)
+    }
+
+    /// `children_of` without the deleted-parent shortcut: what the cascade walk itself
+    /// needs, since it runs for a parent that is being deleted.
+    fn children_of_raw(&self, parent: u64) -> Vec<u64> {
         if let Some(hit) = self.memo.borrow().get(&parent) {
             return hit.clone();
         }
@@ -440,6 +453,12 @@ impl ToOneRel {
 
     /// The parent this child belongs to: the memo when it knows, the child's cached
     /// foreign key, or one point `SELECT`.
+    /// Whether the container is re-reading rows an engine cascade touched.
+    fn reconciling(&self) -> bool {
+        self.with_container(|c| c.inner.reconciling.get())
+            .unwrap_or(false)
+    }
+
     pub(crate) fn parent_of(&self, child: u64) -> Option<u64> {
         if let Some(p) = self.memo_parent.borrow().get(&child) {
             return Some(*p);
@@ -525,12 +544,13 @@ impl ToOneRel {
     /// A child left. The memo knows its parent when the parent was ever read; otherwise the
     /// file still holds the row until the flush, so one point `SELECT` answers.
     pub(crate) fn child_removed(&self, child: u64) {
-        let parent = self
-            .memo_parent
-            .borrow()
-            .get(&child)
-            .copied()
-            .or_else(|| self.parent_of(child));
+        let memo = self.memo_parent.borrow().get(&child).copied();
+        // After an engine cascade the parent is gone too; the file has nothing to say.
+        let parent = if memo.is_none() && self.reconciling() {
+            None
+        } else {
+            memo.or_else(|| self.parent_of(child))
+        };
         if let Some(p) = parent {
             self.forget(p);
             self.announce_parent(p);
@@ -544,12 +564,13 @@ impl ToOneRel {
     /// turn stay coherent for anything watching.
     pub(crate) fn reparent(&self, child: u64) {
         let new = (self.read_fk)(child);
-        let old = self
-            .memo_parent
-            .borrow()
-            .get(&child)
-            .copied()
-            .or_else(|| self.former_parent_file(child));
+        let memo = self.memo_parent.borrow().get(&child).copied();
+        // An engine `SET NULL` re-pointed this child away from a parent that is gone.
+        let old = if memo.is_none() && self.reconciling() {
+            None
+        } else {
+            memo.or_else(|| self.former_parent_file(child))
+        };
         if let Some(p) = old {
             self.forget(p);
         }
@@ -601,7 +622,37 @@ impl ToOneRel {
     }
 
     pub(crate) fn parent_deleted(&self, container: &ModelContainer, parent: u64) {
-        let children = self.children_of(parent);
+        // With no undo stack to serve, the engine's own `ON DELETE CASCADE` / `SET NULL`
+        // does the work in the flush, in one statement per table; the resident children
+        // are re-read afterwards (`reconcile_engine_cascades`). Walking them here would read
+        // every child row and then issue deletes the engine has already performed.
+        if container.engine_cascade_allowed()
+            && matches!(self.delete, DeleteRule::Cascade | DeleteRule::Nullify)
+        {
+            self.forget(parent);
+            container.note_engine_cascade(self.child_table);
+            // A child inserted this same turn is not in the file, so the engine never sees
+            // the pair: the flush would write it against a parent its own DELETE removes.
+            // Those few take the in-process path (a delete absorbs the pending insert).
+            let pending: Vec<u64> = container
+                .dirty_rows_of(self.child_store)
+                .into_iter()
+                .filter(|(c, state)| {
+                    *state == DirtyRow::Insert && (self.read_fk)(*c) == Some(parent)
+                })
+                .map(|(c, _)| c)
+                .collect();
+            for child in pending {
+                match self.delete {
+                    DeleteRule::Cascade => (self.delete_child)(child),
+                    _ => {
+                        (self.write_fk)(child, None);
+                    }
+                }
+            }
+            return;
+        }
+        let children = self.children_of_raw(parent);
         self.forget(parent);
         if children.is_empty() {
             return;
@@ -876,6 +927,17 @@ impl JoinRel {
                 return hit.clone();
             }
         }
+        // A row deleted this turn holds no memberships, whatever the file says until the flush.
+        let own_store = if forward { self.a_store } else { self.b_store };
+        if self.with_container(|c| c.dirty_state_of(own_store, key)) == Some(Some(DirtyRow::Delete))
+        {
+            return Vec::new();
+        }
+        self.members_of_raw(key, forward)
+    }
+
+    /// `members_of` without the deleted-row shortcut: what a deletion's own upkeep reads.
+    fn members_of_raw(&self, key: u64, forward: bool) -> Vec<u64> {
         let (own_col, other_col) = if forward {
             (self.parent_col, self.child_col)
         } else {
@@ -910,6 +972,13 @@ impl JoinRel {
 
     /// Correct a freshly-selected member list against this turn's unflushed link/unlink rows.
     fn overlay_members(&self, key: u64, forward: bool, ids: &mut Vec<u64>) {
+        // Members whose own row is leaving this turn leave the list now; the engine takes
+        // their membership rows in the flush.
+        let other_store = if forward { self.b_store } else { self.a_store };
+        ids.retain(|id| {
+            self.with_container(|c| c.dirty_state_of(other_store, *id))
+                != Some(Some(DirtyRow::Delete))
+        });
         let Some(dirty) = self.with_container(|c| c.dirty_rows_of(self.join_store)) else {
             return;
         };
@@ -922,7 +991,9 @@ impl JoinRel {
                 continue;
             }
             let at = ids.iter().position(|m| *m == other);
-            match (state != DirtyRow::Delete, at) {
+            let other_deleted = self.with_container(|c| c.dirty_state_of(other_store, other))
+                == Some(Some(DirtyRow::Delete));
+            match (state != DirtyRow::Delete && !other_deleted, at) {
                 (false, Some(i)) => {
                     ids.remove(i);
                 }
@@ -987,6 +1058,16 @@ impl JoinRel {
         if self.store.with_untracked(|k| k.get(handle).is_some()) {
             return true;
         }
+        // A row inserted this turn has no memberships in the file yet, so the dirty and
+        // resident checks above were the whole answer: no probe for a brand-new parent or
+        // child, which is what a seed or a "create with tags" does.
+        let fresh = self.with_container(|c| {
+            c.dirty_state_of(self.a_store, parent) == Some(DirtyRow::Insert)
+                || c.dirty_state_of(self.b_store, child) == Some(DirtyRow::Insert)
+        });
+        if fresh == Some(true) {
+            return false;
+        }
         self.with_container(|c| {
             !c.select_id_column(
                 &format!(
@@ -1048,13 +1129,47 @@ impl JoinRel {
 
     /// Either side's row was deleted: its memberships go with it, and under that side's own
     /// cascade rule so do the rows across the join that nobody else still holds.
+    /// Drop the memos a deleted row appears in: its own list, and the counterparts' lists
+    /// that name it.
+    fn forget_side(&self, is_a: bool, key: u64) {
+        let (own, others) = if is_a {
+            (&self.memo_fwd, &self.memo_rev)
+        } else {
+            (&self.memo_rev, &self.memo_fwd)
+        };
+        own.borrow_mut().remove(&key);
+        others
+            .borrow_mut()
+            .retain(|_, members| !members.contains(&key));
+    }
+
     pub(crate) fn side_deleted(&self, is_a: bool, key: u64) {
-        let others = self.members_of(key, is_a);
+        let engine = self
+            .with_container(|c| c.engine_cascade_allowed())
+            .unwrap_or(false);
+        let rule = if is_a {
+            self.a_delete
+        } else {
+            self.b_delete.get()
+        };
+        if engine {
+            // The join table's foreign keys cascade in the engine: the memberships leave
+            // with the row, in the flush, and the join rows resident here are re-read after
+            // it. Only the cascade rule's counterpart deletes still need the member list.
+            self.forget_side(is_a, key);
+            self.with_container(|c| c.note_engine_cascade(self.join_table));
+            if rule != DeleteRule::Cascade {
+                return;
+            }
+        }
+        let others = self.members_of_raw(key, is_a);
         if others.is_empty() {
             return;
         }
+        // In process (an undo stack or a transaction participant is watching): each
+        // membership leaves through the pipeline, so both see it go.
         let capture = day_model::record_capture_active();
-        for other in &others {
+        for other in others.iter().filter(|_| !engine) {
             let (p, c) = if is_a { (key, *other) } else { (*other, key) };
             let handle = day_model::Key::Pair(p, c).handle();
             if capture && self.store.with_untracked(|k| k.get(handle).is_none()) {
@@ -1071,11 +1186,6 @@ impl JoinRel {
                 k.remove(handle);
             });
         }
-        let rule = if is_a {
-            self.a_delete
-        } else {
-            self.b_delete.get()
-        };
         if rule == DeleteRule::Cascade {
             // Cascade across a join takes the rows this one held, but only those no other
             // row still holds, or deleting one album would take a shared photo with it.

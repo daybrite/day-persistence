@@ -862,6 +862,10 @@ pub trait Model: Identified + day_model::ApplyField + Clone + 'static {
     const COLUMNS: &'static [ColumnDef];
     /// Composite indexes from struct-level `#[model(index("a", "b"))]`.
     const COMPOSITE_INDEXES: &'static [&'static [&'static str]] = &[];
+    /// `#[model(unique("a", "b"))]` on the struct: multi-column UNIQUE constraints, kept as
+    /// unique indexes (`day_uidx_{table}_{a}_{b}`), part of the fingerprint and of the
+    /// lightweight migration.
+    const UNIQUE_INDEXES: &'static [&'static [&'static str]] = &[];
     /// Full-text-indexed columns from struct-level `#[model(fts("a", "b"))]`: an
     /// external-content FTS5 shadow table plus sync triggers, generated at open.
     const FTS_COLUMNS: &'static [&'static str] = &[];
@@ -994,6 +998,13 @@ pub fn model_fingerprint<M: Model>() -> u64 {
         eat(&[c.not_null as u8, c.unique as u8, c.indexed as u8]);
     }
     for idx in M::COMPOSITE_INDEXES {
+        for c in *idx {
+            eat(c.as_bytes());
+        }
+        eat(b"|");
+    }
+    for idx in M::UNIQUE_INDEXES {
+        eat(b"uniq:");
         for c in *idx {
             eat(c.as_bytes());
         }
@@ -1169,6 +1180,9 @@ struct DirtyState {
     /// (store, key) → pending statement kind, in first-touch order.
     rows: HashMap<(u64, u64), DirtyRow>,
     order: Vec<(u64, u64)>,
+    /// store → its dirty keys, so a relation's mid-turn overlay reads one store's rows
+    /// instead of scanning every store's.
+    by_store: HashMap<u64, Vec<u64>>,
     /// Stores whose whole value was rewritten (a wholesale `Store::update`), flushed by
     /// upserting every resident row. With a lazy cache no "delete the rest" is possible (the
     /// rest was never loaded), so wholesale rewrites are a resync of the working set only.
@@ -1212,6 +1226,7 @@ impl DirtyState {
             let next = newer.rows[&id].clone();
             if !self.rows.contains_key(&id) {
                 self.order.push(id);
+                self.by_store.entry(id.0).or_default().push(id.1);
             }
             match (self.rows.get_mut(&id), next) {
                 (Some(DirtyRow::Update(old)), DirtyRow::Update(cols)) => {
@@ -1254,6 +1269,7 @@ impl DirtyState {
         let id = (store, key);
         if !self.rows.contains_key(&id) {
             self.order.push(id);
+            self.by_store.entry(store).or_default().push(key);
         }
         add_author(self.authors.entry(id).or_default(), change.author);
         let slot = self.rows.entry(id).or_insert(DirtyRow::Update(Vec::new()));
@@ -1486,6 +1502,14 @@ pub(crate) struct ContainerInner {
     /// Bytes of lazy blob columns read or written recently, bounded by `blob_cache_limit`.
     blob_memo: RefCell<blob::BlobMemo>,
     blob_cache_limit: Cell<usize>,
+    /// Child tables whose rows the engine's `ON DELETE` clauses are taking or nullifying in
+    /// the flush under way, with no undo stack to serve: their resident rows are re-read
+    /// after the commit (relations.rs, `parent_deleted`).
+    engine_cascades: RefCell<Vec<&'static str>>,
+    /// Set while `reconcile_engine_cascades` re-reads the child tables. Every row it finds
+    /// gone or re-pointed got that way because its parent was deleted, so relation upkeep
+    /// skips the point lookups that would ask the file for a parent that no longer exists.
+    pub(crate) reconciling: Cell<bool>,
     /// The last autosave failure, observable by the UI (`when(container.last_error()…)`).
     pub(crate) error: day_reactive::Signal<Option<String>>,
     /// Guards re-entrant flushes (a turn-end firing during an explicit save).
@@ -1554,6 +1578,8 @@ impl ModelContainer {
                 eviction_retry: RefCell::new(HashMap::new()),
                 blob_memo: RefCell::new(blob::BlobMemo::default()),
                 blob_cache_limit: Cell::new(DEFAULT_BLOB_CACHE_LIMIT),
+                engine_cascades: RefCell::new(Vec::new()),
+                reconciling: Cell::new(false),
                 error,
                 flushing: Cell::new(false),
             }),
@@ -1660,6 +1686,47 @@ impl ModelContainer {
     /// Values the blob memo currently holds.
     pub fn blob_cache_len(&self) -> usize {
         self.inner.blob_memo.borrow().len()
+    }
+
+    /// Whether a delete may leave its rule to the engine's `ON DELETE` clause: no undo stack
+    /// is capturing (it needs the removed rows to restore them) and no transaction
+    /// participant is installed (its change set would miss the rows the engine removed).
+    pub(crate) fn engine_cascade_allowed(&self) -> bool {
+        !day_model::record_capture_active() && self.inner.participant.borrow().is_none()
+    }
+
+    /// A relation whose parent row is being deleted this turn, with no undo stack to serve:
+    /// the engine's `ON DELETE` clause will take or nullify the children in the flush, and
+    /// the resident ones are re-read afterwards.
+    pub(crate) fn note_engine_cascade(&self, child_table: &'static str) {
+        let mut tables = self.inner.engine_cascades.borrow_mut();
+        if !tables.contains(&child_table) {
+            tables.push(child_table);
+        }
+    }
+
+    /// After a flush whose parent deletes the engine cascaded: re-read the resident rows of
+    /// the child tables (vanished rows announce as deletes, nullified keys as field changes,
+    /// both under the database's own author), drop their relation memos and re-run the live
+    /// queries that read them. A vanished child is itself a parent whose children the engine
+    /// took too, so the pass repeats while the announcements name new tables.
+    fn reconcile_engine_cascades(&self) {
+        for _ in 0..16 {
+            let tables: Vec<&'static str> =
+                std::mem::take(&mut *self.inner.engine_cascades.borrow_mut());
+            if tables.is_empty() {
+                return;
+            }
+            self.inner.reconciling.set(true);
+            let refreshed = self.refresh_resident_in(Some(&tables));
+            self.inner.reconciling.set(false);
+            if let Err(error) = refreshed {
+                self.inner.error.set(Some(error.to_string()));
+                return;
+            }
+            self.invalidate_relation_memos_of(&tables);
+            self.requery_tables(&tables);
+        }
     }
 
     /// After a successful flush: settle every written row's lazy fields (pending → stored),
@@ -1985,6 +2052,7 @@ impl ModelContainer {
                     self.enforce_cache_limit(store, &[], false);
                 }
                 self.settle_blobs(&dirty);
+                self.reconcile_engine_cascades();
                 self.inner.error.set_if_changed(None);
                 self.run_deferred_requeries(stmts);
             }
@@ -2332,13 +2400,17 @@ impl ModelContainer {
 
     /// This turn's unflushed rows of one store: what relation reads overlay.
     pub(crate) fn dirty_rows_of(&self, store_id: u64) -> Vec<(u64, DirtyRow)> {
-        self.inner
-            .dirty
-            .borrow()
-            .rows
-            .iter()
-            .filter(|((s, _), _)| *s == store_id)
-            .map(|((_, k), state)| (*k, state.clone()))
+        let dirty = self.inner.dirty.borrow();
+        let Some(keys) = dirty.by_store.get(&store_id) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|k| {
+                dirty
+                    .rows
+                    .get(&(store_id, *k))
+                    .map(|state| (*k, state.clone()))
+            })
             .collect()
     }
 
@@ -3117,6 +3189,11 @@ impl ModelContainer {
             columns: vec![c.to_string()],
             unique: true,
         }));
+        out.extend(M::UNIQUE_INDEXES.iter().map(|idx| DeclaredIndex {
+            name: format!("day_uidx_{bare}_{}", idx.join("_")),
+            columns: idx.iter().map(|c| c.to_string()).collect(),
+            unique: true,
+        }));
         out
     }
 
@@ -3870,6 +3947,8 @@ impl ModelContainer {
         // (store, statement shape, a fingerprint of the `SET` values) → the batch it joins.
         let mut open: HashMap<(u64, String, u64), usize> = HashMap::new();
         let mut open_deletes: HashMap<(u64, String, u64), usize> = HashMap::new();
+        // store → the insert batch collecting its new rows.
+        let mut open_inserts: HashMap<u64, usize> = HashMap::new();
 
         for id in &dirty.order {
             let Some(state) = dirty.rows.get(id) else {
@@ -3910,9 +3989,21 @@ impl ModelContainer {
                 }
                 DirtyRow::Insert => {
                     if let Some(row) = (hooks.row_for)(key) {
-                        let (sql, params) = upsert_stmt(hooks, &row);
-                        batches.push(Batch::Single(sql, params));
                         capture_as(RowChangeKind::Inserted);
+                        match open_inserts.get(&store_id) {
+                            Some(&i) => {
+                                if let Batch::Inserts { rows, .. } = &mut batches[i] {
+                                    rows.push(row);
+                                }
+                            }
+                            None => {
+                                open_inserts.insert(store_id, batches.len());
+                                batches.push(Batch::Inserts {
+                                    store: store_id,
+                                    rows: vec![row],
+                                });
+                            }
+                        }
                     }
                 }
                 DirtyRow::Update(cols) => {
@@ -3978,6 +4069,12 @@ impl ModelContainer {
         for batch in batches.into_iter().chain(deletes) {
             match batch {
                 Batch::Single(sql, params) => stmts.push((sql, params)),
+                Batch::Inserts { store, rows } => {
+                    let Some(hooks) = tables.get(&store) else {
+                        continue;
+                    };
+                    insert_stmts(hooks, rows, &mut stmts);
+                }
                 Batch::Keyed { store, set, keys } => {
                     let Some(hooks) = tables.get(&store) else {
                         continue;
@@ -4312,9 +4409,11 @@ fn keys_where_of(hooks: &TableHooks) -> KeysWhere {
 
 /// One statement the fold will write, before the mergeable ones have merged.
 enum Batch {
-    /// Stands alone: an upsert (its values are the row's own), or a row addressed by a
-    /// composite key, which no single-column `IN` can express.
+    /// Stands alone: a row-level rewrite (its values are the row's own), or a row addressed
+    /// by a composite key, which no single-column `IN` can express.
     Single(String, Vec<Value>),
+    /// One table's inserted rows: a multi-row upsert, chunked by the parameter ceiling.
+    Inserts { store: u64, rows: Vec<Vec<Value>> },
     /// Same table, same operation, same values: one statement per chunk of keys.
     Keyed {
         store: u64,
@@ -4465,9 +4564,28 @@ fn select_list(hooks: &TableHooks) -> String {
         .join(", ")
 }
 
+/// One table's inserted rows as multi-row upserts: as many rows per statement as the
+/// parameter ceiling allows, so a thousand new rows are a few statements rather than a
+/// thousand.
+fn insert_stmts(hooks: &TableHooks, rows: Vec<Vec<Value>>, out: &mut Vec<(String, Vec<Value>)>) {
+    let per_row = hooks.columns.len().max(1);
+    let per_stmt = (MAX_BOUND_PARAMS / per_row).max(1);
+    for chunk in rows.chunks(per_stmt) {
+        let sql = upsert_sql(hooks, chunk.len());
+        let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
+        out.push((sql, params));
+    }
+}
+
 fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
+    (upsert_sql(hooks, 1), row.to_vec())
+}
+
+/// `INSERT … VALUES (…), (…) ON CONFLICT(key) DO UPDATE SET …` for `rows` rows.
+fn upsert_sql(hooks: &TableHooks, rows: usize) -> String {
     let cols = column_list(&hooks.columns);
-    let marks = vec!["?"; hooks.columns.len()].join(", ");
+    let one = format!("({})", vec!["?"; hooks.columns.len()].join(", "));
+    let marks = vec![one.as_str(); rows.max(1)].join(", ");
     // A true upsert, not `INSERT OR REPLACE`: the conflict path fires `UPDATE` triggers, which
     // is what keeps the generated FTS/R*Tree shadows in sync (`OR REPLACE`'s implicit delete
     // skips `AFTER DELETE` triggers unless recursive_triggers is on). A lazy column keeps its
@@ -4491,13 +4609,10 @@ fn upsert_stmt(hooks: &TableHooks, row: &[Value]) -> (String, Vec<Value>) {
     } else {
         format!("DO UPDATE SET {sets}")
     };
-    (
-        format!(
-            "INSERT INTO {} ({cols}) VALUES ({marks}) ON CONFLICT({}) {conflict}",
-            hooks.name.sql(),
-            column_list(&hooks.key_cols)
-        ),
-        row.to_vec(),
+    format!(
+        "INSERT INTO {} ({cols}) VALUES {marks} ON CONFLICT({}) {conflict}",
+        hooks.name.sql(),
+        column_list(&hooks.key_cols)
     )
 }
 

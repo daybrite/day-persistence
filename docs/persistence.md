@@ -212,7 +212,12 @@ The rules are short. A struct maps to a snake_case table and a field to a column
 name, each overridable (`table =`, `column =`). Types map through one public trait
 (`ColumnValue`, below): `String` → `TEXT`, integers and `bool` → `INTEGER`, `f32`/`f64` →
 `REAL`, `Vec<u8>` → `BLOB`, `Option<T>` wraps any of them and owns `NULL`. `#[model(index)]` on
-a field, `index("a", "b")` on the struct for composites, `unique` for constraints. Tables are
+a field, `index("a", "b")` on the struct for composites; `#[model(unique)]` on a field and
+`unique("project", "number")` on the struct for constraints (the multi-column form is a unique
+index, `day_uidx_{table}_{a}_{b}`, part of the fingerprint, added or dropped by the
+lightweight migration; adding it over rows that already repeat the pair fails the open and
+leaves the file as it was). A duplicate fails the flush with SQLite's own
+`UNIQUE constraint failed`, and the rejected row stays dirty until it is changed or deleted. Tables are
 created `STRICT` when the engine accepts the keyword (always, for the bundled build) and plain
 otherwise. `#[obs(skip)]` removes a field from both halves; a field the change log cannot name
 could never mark its row dirty, so persisting it would silently lose edits.
@@ -313,10 +318,13 @@ same columns to the same values (the shape a multi-selection edit makes, where o
 written across every selected row). Updates carrying different values keep their own statements,
 because `SET` holds one value per column. Deleting a group of five shapes is one statement, and
 renaming twenty rows to the same name is one statement. Rows keyed by more than one column (a
-join table's membership, which no single-column `IN` names) stay unbatched, and so do inserts,
-which already fold to one multi-row upsert. A batch longer than SQLite's bound
-parameter limit splits into chunks inside the same transaction, so the whole flush still
-commits or rolls back together. `record_sql` shows the batched form, which is what to assert.
+join table's membership, which no single-column `IN` names) stay unbatched as deletes and
+updates. Inserts batch per table into one multi-row upsert,
+`INSERT … VALUES (…), (…), … ON CONFLICT(key) DO UPDATE SET …`, gathered at the place of the
+table's first insert in the flush (a seed of a thousand rows of three columns is four
+statements), memberships included. A batch longer than SQLite's bound parameter limit splits
+into chunks inside the same transaction, so the whole flush still commits or rolls back
+together. `record_sql` shows the batched form, which is what to assert.
 
 Within the transaction, deletes always come last. A relation column's `ON DELETE CASCADE`
 fires per statement (`DEFERRABLE` defers the constraint check, never the action), so a
@@ -743,10 +751,19 @@ wakes exactly the readers of that parent's relation rather than every reader of 
 **Delete rules** are declared on the `Many` side and default to `nullify` (SwiftData's):
 children survive and their references clear, which requires `Option<One<M>>`; wiring refuses
 `nullify` over a required reference, naming the fix. `cascade` deletes the children with the
-parent, recursively and through the normal pipeline: the children come from one indexed
-`SELECT`, their deletes fold into chunked statements, and the engine's own `ON DELETE`
-clause backstops rows this process never saw. With an undo stack installed the cascade
-materializes the rows it removes, so it is one undo unit that restores the whole subtree.
+parent, recursively. Ordinarily the engine does it: the parent's one `DELETE` carries
+`ON DELETE CASCADE` / `SET NULL` through the whole subtree inside the flush, and after the
+commit the container re-reads the resident rows of the tables the rule reaches, so a
+vanished child announces as a delete and a nullified reference as a field change (both under
+`EXTERNAL_AUTHOR`), the relation memos of those tables are dropped, and the live queries over
+them re-run. A project with 25 000 issues and their comments, events and memberships is one
+statement plus a few re-reads. Two things keep the walk in process instead, where every child
+leaves through the pipeline as its own change: an installed undo stack, which needs the
+removed rows to restore them (the cascade is then one undo unit that restores the whole
+subtree), and a transaction participant, whose change set must list every row the
+transaction removed. Children inserted in the same turn as their parent's delete always take
+the in-process path, since the file has not seen them. A row deleted this turn already reads
+as childless and memberless before the flush.
 `deny` refuses while children remain, through `container.delete::<M>(id)`, the checked path; a
 raw `restructure` delete cannot be refused after the fact, so deny is the one rule that needs
 it. The generated DDL carries the matching `REFERENCES … ON DELETE …` clause, `DEFERRABLE
@@ -773,9 +790,13 @@ notes: Many<Note>,                       // on Tag
 #[model(relation(target = Tag, join = "note_tags"))]
 tags: Many<Tag>,                         // on Note — the same memberships, read the other way
 
-tag.notes().add(note_id);                // one INSERT into note_tags
+tag.notes().add(note_id);                // one membership row, batched with the flush's others
 note.tags().contains(tag_id)             // true, from the same row
 ```
+
+Adding a membership checks the turn's pending rows and the resident ones first, and asks the
+file (`SELECT 1 … WHERE` the pair) only when neither row is new this turn, since a row
+inserted in this turn cannot already hold a membership in the file.
 
 Deleting either side drops its memberships; under `cascade` it also takes the rows across the
 join that no other row still holds, so deleting one album never takes a shared photo with it.
@@ -1109,9 +1130,11 @@ column written: a row-level replacement, or a row of a store rewritten wholesale
 one transaction, a worker job's intermediate saves included, and same-row entries coalesce
 the way the autosave fold does: an insert absorbs later updates, a delete absorbs what came
 before it, updates union their columns, a wholesale write supersedes a column list. A rollback
-clears the set. It covers relation upkeep and in-process cascades; rows the engine's own
-`ON DELETE` clause removed without the process faulting them are not in it, so a participant
-that needs complete capture of raw SQL keeps guard triggers for that path.
+clears the set. It covers relation upkeep and cascades: while a participant is installed,
+delete rules run in process (see [Relations](#relations)), so every row a cascade or a
+nullify reaches is in the set, resident or not. Rows removed by raw SQL an app runs itself
+are not, so a participant that needs complete capture of raw SQL keeps guard triggers for
+that path.
 
 Callbacks must persist their state in that SQL transaction and must not reenter the container,
 mutate reactive models, commit, roll back, or perform network I/O. A failed callback may be retried;

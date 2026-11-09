@@ -251,10 +251,10 @@ fn cascade_deletes_children_with_the_parent_in_one_flush() {
         lodging.with_untracked(|k| k.get(12).is_some()),
         "other trip's"
     );
-    // Two tables, two statements: the parent by key, its two children as one `IN`.
-    assert_eq!(sql.len(), 2, "{sql:?}");
-    assert_eq!(sql[0], "DELETE FROM \"trips\" WHERE \"id\" = ?");
-    assert_eq!(sql[1], "DELETE FROM \"lodging\" WHERE \"id\" IN (?, ?)");
+    // One statement: with no undo stack installed the engine's ON DELETE CASCADE takes the
+    // children in the flush, and the resident ones were re-read away afterwards.
+    assert_eq!(sql, ["DELETE FROM \"trips\" WHERE \"id\" = ?"]);
+    assert_eq!(c.table_count::<Lodging>().expect("count"), 1);
 }
 
 #[test]
@@ -289,8 +289,10 @@ fn cascade_recurses_through_a_self_referential_tree() {
     nodes.restructure("delete", Op::Delete, root, |v| {
         v.remove(ModelId::<Node>::of(root).handle());
     });
-    // Three generations went; the unrelated root stayed.
+    // The flush takes three generations through the engine; the unrelated root stayed.
+    c.save().expect("flush");
     assert_eq!(nodes.keys().len(), 1);
+    assert_eq!(c.table_count::<Node>().expect("count"), 1);
     assert!(nodes.with_untracked(|k| k.get(ModelId::<Node>::of(other).handle()).is_some()));
 }
 
@@ -396,11 +398,11 @@ fn nullify_clears_optional_references_and_the_children_survive() {
         .expect("flush");
     assert!(books.with_untracked(|k| k.get(10).is_some()), "survived");
     assert_eq!(books.elem(10).author().peek(), None, "reference cleared");
-    assert!(
-        sql.iter()
-            .any(|s| s.starts_with("UPDATE \"books\" SET \"author\" = ?")),
-        "the nullify folded to UPDATE statements: {sql:?}"
-    );
+    assert_eq!(books.elem(11).author().peek(), None, "reference cleared");
+    // The engine's ON DELETE SET NULL did the clearing: one statement, and the resident
+    // children were re-read with their references gone.
+    assert_eq!(sql, ["DELETE FROM \"authors\" WHERE \"id\" = ?"]);
+    assert_eq!(c.table_count::<Book>().expect("count"), 2);
 }
 
 #[test]
@@ -868,12 +870,9 @@ fn a_self_referential_cascade_flushes_as_one_statement() {
         .expect("flush");
 
     assert!(nodes.keys().is_empty(), "the whole subtree went");
-    // One table, one shape: five rows leave in a single statement.
-    assert_eq!(sql.len(), 1, "{sql:?}");
-    assert_eq!(
-        sql[0],
-        "DELETE FROM \"nodes\" WHERE \"id\" IN (?, ?, ?, ?, ?)"
-    );
+    // One statement for the group; the engine's cascade takes the four it held.
+    assert_eq!(sql, ["DELETE FROM \"nodes\" WHERE \"id\" = ?"]);
+    assert_eq!(c.table_count::<Node>().expect("count"), 0);
 }
 
 #[test]

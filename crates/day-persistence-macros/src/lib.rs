@@ -114,6 +114,8 @@ struct StructDef {
     /// someone else, so it is read-only and gets neither DDL nor a migration.
     external: Option<String>,
     composites: Vec<Vec<String>>,
+    /// `unique("a", "b")`: multi-column UNIQUE constraints, as unique indexes.
+    uniques: Vec<Vec<String>>,
     fts: Vec<String>,
     fts_tokenize: Option<String>,
     spatial: Option<(String, String)>,
@@ -290,6 +292,17 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             ));
         }
     }
+    for (what, lists) in [("index", &def.composites), ("unique", &def.uniques)] {
+        for cols in lists {
+            for c in cols {
+                if !column_names.contains(&c.as_str()) {
+                    return Err(format!(
+                        "Model: {what}(…) names `{c}`, which is not a persisted column of `{name}`"
+                    ));
+                }
+            }
+        }
+    }
     if let Some((lat, lon)) = &def.spatial {
         for c in [lat, lon] {
             if !column_names.contains(&c.as_str()) {
@@ -300,6 +313,20 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         }
     }
 
+    let uniques = def
+        .uniques
+        .iter()
+        .map(|cols| {
+            format!(
+                "&[{}]",
+                cols.iter()
+                    .map(|c| format!("{c:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let composites = def
         .composites
         .iter()
@@ -563,6 +590,7 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
          \x20   const KEY_SQL: day_persistence::SqlType = {key_sql};\n\
          \x20   const COLUMNS: &'static [day_persistence::ColumnDef] = &[\n{columns}    ];\n\
          \x20   const COMPOSITE_INDEXES: &'static [&'static [&'static str]] = &[{composites}];\n\
+         \x20   const UNIQUE_INDEXES: &'static [&'static [&'static str]] = &[{uniques}];\n\
          {fts_const}{spatial_const}{relations_const}{links_const}{external_const}{lazy_const}\
          \x20   fn to_row(&self) -> Vec<day_persistence::Value> {{\n\
          \x20       vec![\n{to_row}        ]\n\
@@ -658,12 +686,7 @@ fn snake_case(name: &str) -> String {
 fn parse_struct(input: TokenStream) -> Result<StructDef, String> {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
 
-    let mut table = None;
-    let mut external = None;
-    let mut composites = Vec::new();
-    let mut fts = Vec::new();
-    let mut fts_tokenize = None;
-    let mut spatial = None;
+    let mut opts = StructOptions::default();
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
@@ -671,15 +694,7 @@ fn parse_struct(input: TokenStream) -> Result<StructDef, String> {
             TokenTree::Punct(p) if p.as_char() == '#' => {
                 if let Some(TokenTree::Group(g)) = tokens.get(i + 1) {
                     if let Some(items) = attr_items(g, "model") {
-                        parse_struct_options(
-                            items,
-                            &mut table,
-                            &mut external,
-                            &mut composites,
-                            &mut fts,
-                            &mut fts_tokenize,
-                            &mut spatial,
-                        )?;
+                        parse_struct_options(items, &mut opts)?;
                     }
                     i += 2;
                     continue;
@@ -704,11 +719,21 @@ fn parse_struct(input: TokenStream) -> Result<StructDef, String> {
         _ => return Err("the derive expects a struct with named fields".into()),
     };
 
+    let StructOptions {
+        table,
+        external,
+        composites,
+        uniques,
+        fts,
+        fts_tokenize,
+        spatial,
+    } = opts;
     Ok(StructDef {
         name,
         table,
         external,
         composites,
+        uniques,
         fts,
         fts_tokenize,
         spatial,
@@ -737,15 +762,31 @@ fn attr_items(bracket: &proc_macro::Group, name: &str) -> Option<Vec<Vec<TokenTr
     }
 }
 
+/// The struct-level `#[model(…)]` options, as `parse_struct_options` fills them.
+#[derive(Default)]
+struct StructOptions {
+    table: Option<String>,
+    external: Option<String>,
+    composites: Vec<Vec<String>>,
+    uniques: Vec<Vec<String>>,
+    fts: Vec<String>,
+    fts_tokenize: Option<String>,
+    spatial: Option<(String, String)>,
+}
+
 fn parse_struct_options(
     items: Vec<Vec<TokenTree>>,
-    table: &mut Option<String>,
-    external: &mut Option<String>,
-    composites: &mut Vec<Vec<String>>,
-    fts: &mut Vec<String>,
-    fts_tokenize: &mut Option<String>,
-    spatial: &mut Option<(String, String)>,
+    opts: &mut StructOptions,
 ) -> Result<(), String> {
+    let StructOptions {
+        table,
+        external,
+        composites,
+        uniques,
+        fts,
+        fts_tokenize,
+        spatial,
+    } = opts;
     for item in items {
         match item.as_slice() {
             [TokenTree::Ident(id), TokenTree::Group(g)]
@@ -855,9 +896,29 @@ fn parse_struct_options(
                 }
                 composites.push(cols);
             }
+            [TokenTree::Ident(id), TokenTree::Group(g)]
+                if id.to_string() == "unique" && g.delimiter() == Delimiter::Parenthesis =>
+            {
+                let mut cols = Vec::new();
+                for tt in g.stream() {
+                    match &tt {
+                        TokenTree::Literal(lit) => cols.push(string_literal(lit)?),
+                        TokenTree::Punct(p) if p.as_char() == ',' => {}
+                        other => {
+                            return Err(format!(
+                                "unique(…) expects string literals, found `{other}`"
+                            ));
+                        }
+                    }
+                }
+                if cols.is_empty() {
+                    return Err("unique(…) names at least one column".into());
+                }
+                uniques.push(cols);
+            }
             other => {
                 return Err(format!(
-                    "unknown #[model] option on the struct: `{}` (supported: table = \"…\", external = \"alias\", index(\"a\", \"b\"), fts(\"a\", \"b\"), spatial(lat = \"…\", lon = \"…\"))",
+                    "unknown #[model] option on the struct: `{}` (supported: table = \"…\", external = \"alias\", index(\"a\", \"b\"), unique(\"a\", \"b\"), fts(\"a\", \"b\"), spatial(lat = \"…\", lon = \"…\"))",
                     tokens_text(other)
                 ));
             }

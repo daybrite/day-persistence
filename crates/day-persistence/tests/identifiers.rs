@@ -347,7 +347,13 @@ fn a_schema_of_keywords_opens_writes_faults_and_queries() {
             c.insert(row);
         }
         let sql = c.record_sql(|| {}).expect("insert flush");
-        assert_eq!(sql.len(), 3, "{sql:?}");
+        // Three new rows, one multi-row upsert.
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert_eq!(
+            sql[0].matches("), (").count(),
+            2,
+            "three VALUES tuples in one statement: {sql:?}"
+        );
         assert!(
             sql[0].starts_with(
                 "INSERT INTO \"order\" (\"primary\", \"order\", \"select\", \"group\", \"where\", \"table\")"
@@ -477,7 +483,13 @@ fn hostile_names_survive_ddl_the_fold_shadows_and_queries() {
         c.insert(weird(2, "quiet morning", "nothing to see"));
         c.insert(weird(3, "rocket science", "tab\tbody"));
         let sql = c.record_sql(|| {}).expect("insert flush");
-        assert_eq!(sql.len(), 3, "{sql:?}");
+        // Three new rows, one multi-row upsert.
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert_eq!(
+            sql[0].matches("), (").count(),
+            2,
+            "three VALUES tuples in one statement: {sql:?}"
+        );
         assert!(
             sql[0].starts_with(
                 "INSERT INTO \"it's \"\"my\"\" notes; -- 🚀\" (\"id; drop table x\", \"title 🧨\", \"body\twith tab\", \"日本語\", \"back`tick [bracket] 'single'\", \"excluded\", \"new\", \"raw \"\"literal\"\" \\n\")"
@@ -729,12 +741,9 @@ fn relations_over_keyword_tables_order_cascade_and_fold() {
             });
         })
         .expect("cascade flush");
-    assert_eq!(sql.len(), 2, "{sql:?}");
-    assert_eq!(sql[0], "DELETE FROM \"group\" WHERE \"id\" = ?");
-    assert_eq!(
-        sql[1],
-        "DELETE FROM \"member; -- 👥\" WHERE \"id\" IN (?, ?, ?)"
-    );
+    // One statement: the engine's own ON DELETE CASCADE takes the members (no undo stack
+    // is installed, so nothing needs them walked in process).
+    assert_eq!(sql, ["DELETE FROM \"group\" WHERE \"id\" = ?"]);
     assert_eq!(c.table_count::<Member>().expect("count"), 0);
 
     // The relation predicate compiles through the same quoted names.

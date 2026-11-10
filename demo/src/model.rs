@@ -72,16 +72,18 @@ impl Database {
     pub fn open(driver: Sqlite, trace: Trace, statements: StatementCount) -> Result<Self, DbError> {
         let container = ModelContainer::open(
             driver.trace_sql(move |sql| {
-                day::log::debug!("SQL: {sql}");
                 // Engine-internal frames (triggers, FTS shadows) arrive as `-- …` comments.
                 if !sql.starts_with("--") {
                     statements.update(|n| *n += 1);
                 }
-                // A blob insert expands to kilobytes of hex; the console shows its head.
+                // Blob inserts expand to large hex strings. Bound both the native log and
+                // the UI console before writing: simulator stderr can block the UI
+                // thread on a full pipe when it receives the entire expanded statement.
                 let line = match sql.char_indices().nth(TRACE_LINE_LIMIT) {
                     Some((cut, _)) => format!("{}… ({} chars)", &sql[..cut], sql.chars().count()),
                     None => sql.to_owned(),
                 };
+                day::log::debug!("SQL: {line}");
                 trace.update(|lines| {
                     if lines.len() == TRACE_LIMIT {
                         lines.pop_front();
@@ -298,6 +300,65 @@ mod tests {
                 lines
                     .iter()
                     .any(|s| s.contains(&format!("SELECT {} AS fixture", TRACE_LIMIT - 1)))
+            );
+        });
+    }
+
+    #[test]
+    fn blob_and_unicode_traces_are_bounded_before_logging() {
+        use std::cell::RefCell;
+
+        // Capture this thread's actual logger output, including the native-console path.
+        // Bounding only the UI trace still lets expanded blobs block simulator stderr.
+        thread_local! {
+            static LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        struct TraceLogger;
+        impl day::log::Log for TraceLogger {
+            fn enabled(&self, _: &day::log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &day::log::Record<'_>) {
+                if record.target() == module_path!().trim_end_matches("::tests") {
+                    LOGS.with(|logs| logs.borrow_mut().push(record.args().to_string()));
+                }
+            }
+            fn flush(&self) {}
+        }
+        day::log::set_logger(&TraceLogger).unwrap();
+        day::log::set_max_level(day::log::LevelFilter::Debug);
+
+        let trace = Signal::new(VecDeque::new());
+        let statements = Signal::new(0);
+        let db = Database::open(Sqlite::memory(), trace, statements).unwrap();
+        trace.update(VecDeque::clear);
+        statements.set(0);
+        LOGS.with(|logs| logs.borrow_mut().clear());
+
+        db.seed_gallery(vec![Picture {
+            title: "Large blob fixture".into(),
+            source: "synthetic fixture".into(),
+            bytes: vec![0xab; 1 << 20],
+        }])
+        .unwrap();
+        db.query(&format!("SELECT '{}' AS fixture", "é".repeat(1000)))
+            .unwrap();
+
+        let lines = trace.get_untracked();
+        assert!(lines.iter().any(|line| line.starts_with("INSERT")));
+        assert!(lines.iter().any(|line| line.contains("ééé")));
+        assert!(lines.iter().any(|line| line.contains("… (")));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= TRACE_LINE_LIMIT + 32)
+        );
+        assert_eq!(statements.get_untracked() as usize, lines.len());
+        LOGS.with(|logs| {
+            let expected: Vec<_> = lines.iter().map(|line| format!("SQL: {line}")).collect();
+            assert!(
+                *logs.borrow() == expected,
+                "the native logger must receive the same bounded statements as the UI"
             );
         });
     }

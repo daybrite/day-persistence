@@ -152,7 +152,7 @@ fn agreement_holds_with_undos_interleaved() {
                 .map(|i| Trip {
                     id: i,
                     name: format!("trip {i}"),
-                    start_day: i as i64,
+                    start_day: i64::from(i),
                     done: false,
                     notes: String::new(),
                 })
@@ -170,8 +170,8 @@ fn agreement_holds_with_undos_interleaved() {
     let mut rng: u64 = 0x2026_0821;
     for step in 0..600u64 {
         rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let key = (rng >> 33) % 40 + 1;
         match step % 6 {
             0 => {

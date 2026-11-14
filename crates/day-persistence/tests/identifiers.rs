@@ -26,6 +26,10 @@ use day_reactive::Binding;
 /// Every name a SQL keyword: the table, the key, each column, the indexed pair.
 #[derive(Model, Clone, Default, PartialEq, Debug)]
 #[model(table = "order", index("group", "select"))]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field is named after an SQL keyword on purpose"
+)]
 struct Order {
     #[model(id, column = "primary")]
     id: u32,
@@ -808,7 +812,7 @@ fn a_join_table_with_a_comment_marker_in_its_name() {
         ["DELETE FROM \"tag posts; -- 🙂\" WHERE \"tags 🙂_id\" = ? AND \"post_id\" = ?"]
     );
     settle();
-    assert!(tagged.ids().is_empty());
+    assert_eq!(tagged.ids(), [] as [day_model::ModelId<Post>; 0]);
 }
 
 // --- migration ------------------------------------------------------------------------------

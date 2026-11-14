@@ -15,7 +15,7 @@ struct Minutes;
 impl ValueCodec<u32> for Minutes {
     const SQL_TYPE: SqlType = SqlType::Integer;
     fn to_sqlite_value(v: &u32) -> Value {
-        Value::Int(*v as i64 / 60)
+        Value::Int(i64::from(*v) / 60)
     }
     fn from_sqlite_value(v: Value) -> Result<u32, DbError> {
         Ok(v.as_int()? as u32 * 60)

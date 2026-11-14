@@ -29,6 +29,7 @@
 //! names and type tokens never has to understand a type, only re-emit it.
 
 use proc_macro::{Delimiter, TokenStream, TokenTree};
+use std::fmt::Write as _;
 
 /// A persistable model: everything `#[derive(Observable)]` generates, plus `impl
 /// day_persistence::Model`: table name, column list, row↔struct mappers and the default row.
@@ -36,7 +37,7 @@ use proc_macro::{Delimiter, TokenStream, TokenTree};
 ///
 /// `#[model(id)]` marks the key (it is `#[obs(key)]` too). Field options: `column = "…"`,
 /// `unique`, `index`, `transient` (observable, never stored), `with = Codec`, `json`. Struct
-/// options: `table = "…"` (snake_cased struct name otherwise), `index("a", "b")` for
+/// options: `table = "…"` (`snake_cased` struct name otherwise), `index("a", "b")` for
 /// composites. `#[obs(skip)]` removes a field from both halves.
 #[proc_macro_derive(Model, attributes(model, obs))]
 pub fn model(input: TokenStream) -> TokenStream {
@@ -110,7 +111,7 @@ impl FieldDef {
 struct StructDef {
     name: String,
     table: Option<String>,
-    /// `external = "alias"`: the table lives in a database ATTACHed under `alias`, managed by
+    /// `external = "alias"`: the table lives in a database `ATTACHed` under `alias`, managed by
     /// someone else, so it is read-only and gets neither DDL nor a migration.
     external: Option<String>,
     composites: Vec<Vec<String>>,
@@ -180,7 +181,7 @@ fn observable_impls(def: &StructDef) -> String {
         .filter(|f| !f.skip && f.relation.is_none() && f.link.is_none())
     {
         let key = if f.key { "#[obs(key)] " } else { "" };
-        out.push_str(&format!("        {key}{}: {},\n", f.name, f.ty));
+        let _ = writeln!(out, "        {key}{}: {},", f.name, f.ty);
     }
     out.push_str("    }\n}\n");
     out
@@ -271,16 +272,17 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
     let mut columns = String::new();
     for f in &persisted {
         let sql = sql_type_expr(f);
-        columns.push_str(&format!(
+        let _ = writeln!(
+            columns,
             "        day_persistence::ColumnDef {{ name: {:?}, field: \"{}\", sql: {sql}, \
-             not_null: {}, unique: {}, indexed: {}, lazy: {} }},\n",
+             not_null: {}, unique: {}, indexed: {}, lazy: {} }},",
             f.column_name(),
             f.name,
             !f.nullable() && !f.lazy,
             f.unique,
             f.indexed,
             f.lazy,
-        ));
+        );
     }
 
     // fts()/spatial() name COLUMNS; a typo would silently index nothing, so check now.
@@ -344,18 +346,19 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
 
     let mut to_row = String::new();
     for f in &persisted {
-        to_row.push_str(&format!("            {},\n", encode_expr(f)));
+        let _ = writeln!(to_row, "            {},", encode_expr(f));
     }
 
     let mut from_row = String::new();
     for f in &def.fields {
         if let Some(i) = persisted.iter().position(|p| p.name == f.name) {
-            from_row.push_str(&format!("            {}: {},\n", f.name, decode_expr(f, i)));
+            let _ = writeln!(from_row, "            {}: {},", f.name, decode_expr(f, i));
         } else {
-            from_row.push_str(&format!(
-                "            {}: ::core::default::Default::default(),\n",
+            let _ = writeln!(
+                from_row,
+                "            {}: ::core::default::Default::default(),",
                 f.name
-            ));
+            );
         }
     }
 
@@ -371,7 +374,8 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             ),
             None => format!("day_persistence::encode_column::<{}>", f.ty),
         };
-        cols.push_str(&format!(
+        let _ = write!(
+            cols,
             "    pub fn {}() -> day_persistence::Col<{}> {{\n\
              \x20       day_persistence::Col::new({:?}, \"{}\", {table:?}, {encode})\n\
              \x20   }}\n",
@@ -379,47 +383,51 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
             f.ty,
             f.column_name(),
             f.name,
-        ));
+        );
     }
     // The static relation reference, for predicates. The instance accessor of the same name
     // lives on the Relations trait and takes `self`, so path syntax finds this one and
     // method-call syntax finds that one, the rule `Trip::name()` already relies on.
     for f in def.fields.iter().filter(|f| f.relation.is_some()) {
         let r = f.relation.as_ref().expect("filtered");
-        cols.push_str(&format!(
+        let _ = write!(
+            cols,
             "    pub fn {}() -> day_persistence::RelationCol<{name}, {}> {{\n\
              \x20       day_persistence::RelationCol::new(\"{}\", {table:?}, \
              <{} as day_persistence::Model>::TABLE)\n\
              \x20   }}\n",
             f.name, r.target, f.name, r.target,
-        ));
+        );
     }
     // A link's predicate builder is a plain RelationCol: the container resolves the
     // (owner, field) pair to the link's join condition at compile time, so `any`/`none`/
     // `is_empty`/`count_ge` read exactly as they do across a keyed relation.
     for f in def.fields.iter().filter(|f| f.link.is_some()) {
         let l = f.link.as_ref().expect("filtered");
-        cols.push_str(&format!(
+        let _ = write!(
+            cols,
             "    pub fn {}() -> day_persistence::RelationCol<{name}, {}> {{\n\
              \x20       day_persistence::RelationCol::new(\"{}\", {table:?}, \
              <{} as day_persistence::Model>::TABLE)\n\
              \x20   }}\n",
             f.name, l.target, f.name, l.target,
-        ));
+        );
     }
     if !def.fts.is_empty() {
-        cols.push_str(&format!(
+        let _ = write!(
+            cols,
             "    pub fn fts() -> day_persistence::FtsRef {{\n\
              \x20       day_persistence::FtsRef {{ columns: <{name} as day_persistence::Model>::FTS_COLUMNS }}\n\
              \x20   }}\n"
-        ));
+        );
     }
     if let Some((lat, lon)) = &def.spatial {
-        cols.push_str(&format!(
+        let _ = write!(
+            cols,
             "    pub fn geo() -> day_persistence::GeoRef {{\n\
              \x20       day_persistence::GeoRef {{ lat: {lat:?}, lon: {lon:?} }}\n\
              \x20   }}\n"
-        ));
+        );
     }
     let col_impl = format!("#[allow(dead_code)]\nimpl {name} {{\n{cols}}}\n");
 
@@ -438,6 +446,10 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         Some(s) => format!("Some({s:?})"),
         None => "None".into(),
     };
+    #[expect(
+        clippy::format_collect,
+        reason = "the derive emits source text, and each item reads as the template it produces"
+    )]
     let relations_const = if rels.is_empty() {
         String::new()
     } else {
@@ -486,6 +498,10 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
                 .collect::<String>()
         )
     };
+    #[expect(
+        clippy::format_collect,
+        reason = "the derive emits source text, and each item reads as the template it produces"
+    )]
     let rel_trait = if rels.is_empty() {
         String::new()
     } else {
@@ -526,6 +542,10 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
         .iter()
         .filter_map(|f| f.link.as_ref().map(|l| (f, l)))
         .collect();
+    #[expect(
+        clippy::format_collect,
+        reason = "the derive emits source text, and each item reads as the template it produces"
+    )]
     let links_const = if links.is_empty() {
         String::new()
     } else {
@@ -556,6 +576,10 @@ fn emit_model(def: &StructDef, key: &FieldDef) -> Result<String, String> {
     };
 
     let lazy_fields: Vec<&FieldDef> = persisted.iter().copied().filter(|f| f.lazy).collect();
+    #[expect(
+        clippy::format_collect,
+        reason = "the derive emits source text, and each item reads as the template it produces"
+    )]
     let lazy_const = if lazy_fields.is_empty() {
         String::new()
     } else {

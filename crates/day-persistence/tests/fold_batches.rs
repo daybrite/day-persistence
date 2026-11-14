@@ -35,7 +35,7 @@ struct Tag {
 type Trace = Rc<RefCell<Vec<String>>>;
 
 fn traced(driver: Sqlite) -> (Sqlite, Trace) {
-    let trace: Trace = Default::default();
+    let trace: Trace = Rc::default();
     let sink = trace.clone();
     (
         driver.trace_sql(move |sql| sink.borrow_mut().push(sql.to_string())),

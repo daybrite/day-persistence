@@ -539,7 +539,7 @@ unsafe extern "C" fn opfs_open(
     };
     (*f).slot = slot;
     (*f).delete_on_close = flags & b::SQLITE_OPEN_DELETEONCLOSE != 0;
-    (*f).base.pMethods = &OPFS_IO;
+    (*f).base.pMethods = &raw const OPFS_IO;
     if !out_flags.is_null() {
         *out_flags = flags;
     }
@@ -569,7 +569,7 @@ unsafe extern "C" fn mem_open(
     (*f).data = Box::into_raw(Box::new(data));
     (*f).name = Box::into_raw(Box::new(key));
     (*f).delete_on_close = flags & b::SQLITE_OPEN_DELETEONCLOSE != 0;
-    (*f).base.pMethods = &MEM_IO;
+    (*f).base.pMethods = &raw const MEM_IO;
     if !out_flags.is_null() {
         *out_flags = flags;
     }
@@ -645,7 +645,7 @@ unsafe extern "C" fn vfs_sleep(_vfs: *mut b::sqlite3_vfs, _micros: c_int) -> c_i
 }
 
 unsafe extern "C" fn vfs_current_time(_vfs: *mut b::sqlite3_vfs, out: *mut f64) -> c_int {
-    *out = 2440587.5 + os::now_ms() / 86_400_000.0;
+    *out = 2_440_587.5 + os::now_ms() / 86_400_000.0;
     b::SQLITE_OK
 }
 

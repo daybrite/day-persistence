@@ -85,7 +85,7 @@ fn another_connections_writes_arrive_precisely_and_do_not_echo() {
     // `pinned` never changed on row 1, so only `title` announced there.
     assert!(!changes.is_empty());
     for c in &changes {
-        assert_eq!(c.author, Some(ModelContainer::EXTERNAL_AUTHOR), "{:?}", c);
+        assert_eq!(c.author, Some(ModelContainer::EXTERNAL_AUTHOR), "{c:?}");
     }
     let row1: Vec<_> = changes
         .iter()

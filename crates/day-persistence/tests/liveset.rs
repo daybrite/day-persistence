@@ -117,8 +117,8 @@ fn narrated_deltas_always_land_on_the_new_set() {
     let mut rng: u64 = 0x2026_0827;
     let mut next = move || {
         rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         rng >> 33
     };
     for _case in 0..500 {
@@ -175,7 +175,7 @@ fn a_long_edit_stream_mirrors_through_the_delta_feed() {
                 .map(|i| Trip {
                     id: i,
                     name: format!("trip {i:02}"),
-                    start: i as i64,
+                    start: i64::from(i),
                     done: false,
                     notes: String::new(),
                 })
@@ -194,8 +194,8 @@ fn a_long_edit_stream_mirrors_through_the_delta_feed() {
     let mut rng: u64 = 0x2026_0818;
     for step in 0..600u64 {
         rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let key = (rng >> 33) % 40 + 1;
         match step % 4 {
             0 => {

@@ -48,7 +48,7 @@ struct EagerPhoto {
 type Trace = Rc<RefCell<Vec<String>>>;
 
 fn traced(driver: Sqlite) -> (Sqlite, Trace) {
-    let trace: Trace = Default::default();
+    let trace: Trace = Rc::default();
     let sink = trace.clone();
     (
         driver.trace_sql(move |sql| sink.borrow_mut().push(sql.to_string())),
@@ -127,9 +127,9 @@ fn the_derive_marks_the_column_lazy_nullable_and_last() {
     assert!(cols.iter().filter(|c| c.name != "data").all(|c| !c.lazy));
     assert_eq!(Photo::LAZY_FIELDS, ["data"]);
     assert_eq!(Document::LAZY_FIELDS, ["body", "preview"]);
-    assert!(Photo::default().data == Blob::stored());
-    assert!(Blob::new(vec![1]) == Blob::new(vec![1]));
-    assert!(Blob::new(vec![1]) != Blob::new(vec![2]));
+    assert_eq!(Photo::default().data, Blob::stored());
+    assert_eq!(Blob::new(vec![1]), Blob::new(vec![1]));
+    assert_ne!(Blob::new(vec![1]), Blob::new(vec![2]));
     assert!(
         Blob::new(vec![]) != Blob::stored(),
         "pending and stored differ"
@@ -352,7 +352,7 @@ fn a_fault_selects_null_for_the_blob_and_reads_it_on_demand_once() {
         std::sync::Arc::ptr_eq(&first, &second),
         "the memo served it"
     );
-    assert!(statements(&trace).is_empty());
+    assert_eq!(statements(&trace), [] as [std::string::String; 0]);
     assert_eq!(c.blob_cache_bytes(), 2_000);
 
     // A collected snapshot carries stored blobs, never bytes.
@@ -390,12 +390,15 @@ fn len_and_ranges_read_only_what_they_ask_for() {
         elem.data().read_range(99_990..200_000).unwrap(),
         data[99_990..]
     );
-    assert!(elem.data().read_range(200_000..200_010).unwrap().is_empty());
-    assert!(elem.data().read_range(5..5).unwrap().is_empty());
+    assert_eq!(
+        elem.data().read_range(200_000..200_010).unwrap(),
+        [] as [u8; 0]
+    );
+    assert_eq!(elem.data().read_range(5..5).unwrap(), [] as [u8; 0]);
     // A reversed range is a caller mistake the accessor answers with nothing, not a panic.
     #[allow(clippy::reversed_empty_ranges)]
     let reversed = 20..10;
-    assert!(elem.data().read_range(reversed).unwrap().is_empty());
+    assert_eq!(elem.data().read_range(reversed).unwrap(), [] as [u8; 0]);
     assert_eq!(c.blob_cache_len(), 0, "ranges and lengths are not memoized");
 
     // The reader walks the value in chunks and lands on the same bytes.
@@ -412,7 +415,7 @@ fn len_and_ranges_read_only_what_they_ask_for() {
     trace.borrow_mut().clear();
     assert_eq!(elem.data().read_range(0..3).unwrap(), data[..3]);
     assert_eq!(elem.data().len().unwrap(), 100_000);
-    assert!(statements(&trace).is_empty());
+    assert_eq!(statements(&trace), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -427,7 +430,7 @@ fn null_and_empty_values_read_as_empty() {
         assert!(e.data().bytes().unwrap().is_empty());
         assert_eq!(e.data().len().unwrap(), 0);
         assert!(e.data().is_empty().unwrap());
-        assert!(e.data().read_range(0..10).unwrap().is_empty());
+        assert_eq!(e.data().read_range(0..10).unwrap(), [] as [u8; 0]);
         let mut out = Vec::new();
         assert_eq!(e.data().reader().read_to_end(&mut out).unwrap(), 0);
     }
@@ -698,7 +701,7 @@ fn restructure_inserts_carry_bytes_too() {
     c.set_autosave(false);
     let store = c.cache::<Photo>();
     store.restructure("add", Op::Insert, 5, |k| {
-        k.push(photo(5, Some(bytes(55, 5))))
+        k.push(photo(5, Some(bytes(55, 5))));
     });
     c.save().expect("flush");
     assert_eq!(raw_blob_len(&c, 5), 55);

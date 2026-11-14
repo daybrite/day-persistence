@@ -1,5 +1,5 @@
 //! Storage operations shared by the UI and headless tests.
-//! See https://daybrite.dev/docs/persistence/ for the extension's public API.
+//! See <https://daybrite.dev/docs/persistence/> for the extension's public API.
 use day::prelude::*;
 use day_persistence::{Blob, DbError, Model, ModelContainer, Sort, Sqlite, Value, schema};
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ pub(crate) struct Photo {
 }
 
 /// The same image with the bytes lazy: a fault reads the row without them, and the gallery
-/// asks for the picture when the row is shown (https://daybrite.dev/docs/persistence/).
+/// asks for the picture when the row is shown (<https://daybrite.dev/docs/persistence/>).
 #[derive(Model, Clone, Debug, Default, PartialEq)]
 #[model(table = "lazy_photos")]
 pub(crate) struct LazyPhoto {
@@ -174,9 +174,14 @@ impl Database {
     pub fn delete(&self, id: u32) -> Result<(), DbError> {
         let store = self.container.cache::<Note>();
         self.container.ensure::<Note>([id])?;
-        store.restructure("lab-delete", day::model::Op::Delete, id as u64, |rows| {
-            rows.remove(id as u64);
-        });
+        store.restructure(
+            "lab-delete",
+            day::model::Op::Delete,
+            u64::from(id),
+            |rows| {
+                rows.remove(u64::from(id));
+            },
+        );
         self.container.save()
     }
 
@@ -268,7 +273,7 @@ mod tests {
         assert!(db.notes().unwrap()[0].done);
         let export = serde_json::to_string(&db.notes().unwrap()).unwrap();
         db.delete(7).unwrap();
-        assert!(db.notes().unwrap().is_empty());
+        assert_eq!(db.notes().unwrap(), [] as [Note; 0]);
         db.replace(parse_notes(&export).unwrap()).unwrap();
         assert_eq!(db.notes().unwrap()[0].id, 7);
         assert!(
@@ -277,7 +282,10 @@ mod tests {
                 .contains("\"total\": 1")
         );
         assert!(trace.with_untracked(|lines| lines.iter().any(|s| s.contains("UPDATE"))));
-        assert!(db.container.integrity_check().unwrap().is_empty());
+        assert_eq!(
+            db.container.integrity_check().unwrap(),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -463,16 +471,16 @@ fn png_disc(w: u32, h: u32, hue: f32, seed: u32) -> Vec<u8> {
     ihdr.extend_from_slice(&w.to_be_bytes());
     ihdr.extend_from_slice(&h.to_be_bytes());
     ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, RGB, deflate, no filter method, no interlace
-    png_chunk(&mut png, b"IHDR", &ihdr);
-    png_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
-    png_chunk(&mut png, b"IEND", &[]);
+    png_chunk(&mut png, *b"IHDR", &ihdr);
+    png_chunk(&mut png, *b"IDAT", &zlib_stored(&raw));
+    png_chunk(&mut png, *b"IEND", &[]);
     png
 }
 
-fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+fn png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     let start = out.len();
-    out.extend_from_slice(kind);
+    out.extend_from_slice(&kind);
     out.extend_from_slice(data);
     let crc = crc32(&out[start..]);
     out.extend_from_slice(&crc.to_be_bytes());
@@ -486,7 +494,7 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
     }
     while let Some(chunk) = chunks.next() {
-        out.push(if chunks.peek().is_none() { 1 } else { 0 });
+        out.push(u8::from(chunks.peek().is_none()));
         let len = chunk.len() as u16;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&(!len).to_le_bytes());
@@ -499,7 +507,7 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
 fn adler32(data: &[u8]) -> u32 {
     let (mut a, mut b) = (1u32, 0u32);
     for &byte in data {
-        a = (a + byte as u32) % 65_521;
+        a = (a + u32::from(byte)) % 65_521;
         b = (b + a) % 65_521;
     }
     (b << 16) | a
@@ -508,7 +516,7 @@ fn adler32(data: &[u8]) -> u32 {
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
-        crc ^= byte as u32;
+        crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = if crc & 1 == 1 {
                 (crc >> 1) ^ 0xEDB8_8320

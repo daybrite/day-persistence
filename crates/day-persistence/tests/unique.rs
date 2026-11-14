@@ -50,7 +50,7 @@ struct Issue {
 type Trace = Rc<RefCell<Vec<String>>>;
 
 fn traced(driver: Sqlite) -> (Sqlite, Trace) {
-    let trace: Trace = Default::default();
+    let trace: Trace = Rc::default();
     let sink = trace.clone();
     (
         driver.trace_sql(move |sql| sink.borrow_mut().push(sql.to_string())),
@@ -113,7 +113,7 @@ fn the_derive_exposes_the_constraint_and_the_ddl_creates_a_unique_index() {
         Issue::UNIQUE_INDEXES,
         [&["project", "number"][..], &["title", "release train"][..]]
     );
-    assert!(IssueV1::UNIQUE_INDEXES.is_empty());
+    assert_eq!(IssueV1::UNIQUE_INDEXES, [] as [&[&str]; 0]);
     let (driver, trace) = traced(Sqlite::memory());
     let c = ModelContainer::open(driver, schema![Project, Issue]).expect("open");
     let ddl: Vec<String> = trace
@@ -278,9 +278,8 @@ fn migration_onto_duplicate_data_fails_at_open_and_leaves_the_file_alone() {
         }
         c.save().expect("seed");
     }
-    let err = match ModelContainer::open(Sqlite::at(&path), schema![Project, Issue]) {
-        Ok(_) => panic!("the unique index cannot be built over duplicates"),
-        Err(err) => err,
+    let Err(err) = ModelContainer::open(Sqlite::at(&path), schema![Project, Issue]) else {
+        panic!("the unique index cannot be built over duplicates")
     };
     assert!(
         err.to_string().contains("UNIQUE constraint failed"),

@@ -65,7 +65,7 @@ fn uuid_rows_survive_a_reopen_and_store_as_blobs() {
         let store = c.cache::<Contact>();
         store.restructure("add", Op::Insert, ada, |v| v.push(contact(ada, "Ada")));
         store.restructure("add", Op::Insert, grace, |v| {
-            v.push(contact(grace, "Grace"))
+            v.push(contact(grace, "Grace"));
         });
         store.elem(ada).name().write("Ada Lovelace".into());
         store.elem(grace).starred().write(true);
@@ -137,7 +137,7 @@ fn the_fold_binds_typed_key_parameters() {
         .record_sql(|| {
             store.restructure("remove", Op::Delete, id, |v| {
                 v.remove(ModelId::<Contact>::of(id).handle());
-            })
+            });
         })
         .expect("delete flush");
     assert_eq!(sql, ["DELETE FROM \"contacts\" WHERE \"id\" = ?"]);
@@ -346,10 +346,10 @@ fn two_default_uuid_rows_coalesce_to_one_stored_row() {
         let c = ModelContainer::open(Sqlite::at(&path), schema![Contact]).expect("open");
         let store = c.cache::<Contact>();
         store.restructure("add", Op::Insert, Uuid::nil(), |v| {
-            v.push(contact(Uuid::nil(), "first"))
+            v.push(contact(Uuid::nil(), "first"));
         });
         store.restructure("add", Op::Insert, Uuid::nil(), |v| {
-            v.push(contact(Uuid::nil(), "second"))
+            v.push(contact(Uuid::nil(), "second"));
         });
         c.save().expect("save");
     }

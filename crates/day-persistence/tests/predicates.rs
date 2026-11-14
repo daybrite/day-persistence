@@ -76,7 +76,7 @@ fn papers() -> ModelContainer {
                 title: title.into(),
                 shelf: shelf.map(str::to_string),
                 pages,
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -108,7 +108,7 @@ fn is_in_matches_the_set_and_nothing_else() {
 fn an_empty_set_matches_nothing_and_its_complement_matches_all() {
     let c = papers();
     let none: [i64; 0] = [];
-    assert!(matching(&c, Paper::pages().is_in(none)).is_empty());
+    assert_eq!(matching(&c, Paper::pages().is_in(none)), [] as [u64; 0]);
     // NOT IN over an empty set is every row whose column is not NULL. That is SQL's rule,
     // since a NULL column is UNKNOWN rather than "not a member".
     assert_eq!(matching(&c, Paper::pages().not_in(none)), [1, 2, 3, 4, 5]);
@@ -161,8 +161,8 @@ fn the_set_is_sorted_so_membership_is_a_binary_search() {
                 id,
                 title: format!("p{id}"),
                 shelf: None,
-                pages: id as i64,
-            })
+                pages: i64::from(id),
+            });
         });
     }
     c.save().expect("seed");
@@ -207,7 +207,10 @@ fn a_multibyte_prefix_matches_by_character() {
     let c = papers();
     assert_eq!(matching(&c, Paper::title().starts_with("École")), [5]);
     assert_eq!(matching(&c, Paper::title().starts_with("Éc")), [5]);
-    assert!(matching(&c, Paper::title().starts_with("Ecole")).is_empty());
+    assert_eq!(
+        matching(&c, Paper::title().starts_with("Ecole")),
+        [] as [u64; 0]
+    );
 }
 
 // --- null tests -----------------------------------------------------------------------
@@ -228,7 +231,7 @@ fn a_reference_column_reports_set_and_unset() {
             v.push(Author {
                 id: ada,
                 name: "Ada".into(),
-            })
+            });
         });
     let essays = c.cache::<Essay>();
     for (id, author) in [(1u32, Some(ada)), (2, None), (3, Some(ada))] {
@@ -237,7 +240,7 @@ fn a_reference_column_reports_set_and_unset() {
                 id,
                 title: format!("e{id}"),
                 author: author.map(One::to),
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -256,7 +259,10 @@ fn a_reference_column_reports_set_and_unset() {
     assert_eq!(ids(Essay::author().is_set()), [1, 3]);
     assert_eq!(ids(Essay::author().is(ada)), [1, 3]);
     assert_eq!(ids(Essay::author().is_one_of([ada])), [1, 3]);
-    assert!(ids(Essay::author().is_one_of(Vec::<ModelId<Author>>::new())).is_empty());
+    assert_eq!(
+        ids(Essay::author().is_one_of(Vec::<ModelId<Author>>::new())),
+        [] as [u64; 0]
+    );
 }
 
 // --- three-valued logic ---------------------------------------------------------------
@@ -391,7 +397,7 @@ fn the_empty_set_compiles_to_a_constant_not_to_in_nothing() {
     // `IN ()` is a syntax error in SQLite rather than an empty set.
     let (sql, params) = compiled(Pred::In("pages", vec![]));
     assert!(sql.contains("WHERE 0"), "{sql}");
-    assert!(params.is_empty());
+    assert_eq!(params, [] as [day_persistence::Value; 0]);
     let (sql, _) = compiled(Pred::NotIn("pages", vec![]));
     assert!(
         sql.contains("WHERE \"papers\".\"pages\" IS NOT NULL"),
@@ -432,7 +438,7 @@ fn id_membership_reads_no_column_at_all() {
     // And it depends on no column, so a column write can never move a row through it.
     let mut cols = Vec::new();
     pred.columns(&mut cols);
-    assert!(cols.is_empty());
+    assert_eq!(cols, [] as [&str; 0]);
 }
 
 #[test]
@@ -521,7 +527,7 @@ fn an_id_set_depends_on_no_column() {
     // A row's key never changes, so no column write can move a row through `IdIn`. That
     // property keeps relation traversal's compilation target free.
     let deps = Fetch::new().filter(Pred::IdIn(vec![1, 2])).dependencies();
-    assert!(deps.local.is_empty());
+    assert_eq!(deps.local, [] as [&str; 0]);
     assert!(!deps.touches_local("pages"));
 }
 
@@ -530,7 +536,7 @@ fn a_local_fetch_crosses_no_relation() {
     let deps = Fetch::new()
         .filter(Paper::title().contains("sort"))
         .dependencies();
-    assert!(deps.related.is_empty());
-    assert!(deps.related_tables().is_empty());
+    assert_eq!(deps.related, [] as [day_persistence::RelatedDep; 0]);
+    assert_eq!(deps.related_tables(), [] as [&str; 0]);
     assert!(!deps.touches_related("lodging", "name"));
 }

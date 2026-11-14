@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! The built-in driver. On native targets the engine is rusqlite, chosen by cargo feature:
-//! `bundled` (the default), `system` (link the OS's libsqlite3), or `cipher` (SQLCipher with
+//! `bundled` (the default), `system` (link the OS's libsqlite3), or `cipher` (`SQLCipher` with
 //! vendored crypto). On web-dom the engine is day-sqlite-worker: `:memory:` databases run
 //! in-process, and file databases are proxied synchronously to the day-sql worker, which
 //! holds them on real OPFS (see the web module at the end of this file). One driver type,
@@ -59,6 +59,10 @@ impl Sqlite {
     /// live"), or `DAY_DATA_DIR` when a host or a test sets it. `name` is a file name, not a path.
     /// Errs where no such directory exists (web has no
     /// filesystem; keep a wasm build on [`Sqlite::memory`] or its own driver).
+    ///
+    /// # Errors
+    /// Returns an error where the platform has no application data directory, or when the directory
+    /// cannot be created.
     pub fn app_data(name: impl AsRef<str>) -> Result<Self, DbError> {
         let name = name.as_ref();
         if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
@@ -73,15 +77,18 @@ impl Sqlite {
         Ok(Sqlite::at(dir.join(name)))
     }
     /// The database key (feature `cipher`; other builds refuse it at open, loudly).
+    #[must_use]
     pub fn key(mut self, key: Secret) -> Self {
         self.opts.key = Some(key);
         self
     }
-    /// Accept a file written by an older SQLCipher generation (`PRAGMA cipher_migrate`).
+    /// Accept a file written by an older `SQLCipher` generation (`PRAGMA cipher_migrate`).
+    #[must_use]
     pub fn cipher_migrate(mut self) -> Self {
         self.opts.cipher_migrate = true;
         self
     }
+    #[must_use]
     pub fn wal(mut self, on: bool) -> Self {
         self.opts.wal = on;
         self
@@ -89,6 +96,9 @@ impl Sqlite {
     /// The directory [`Sqlite::app_data`] resolves into, for apps that manage their document
     /// files there (numbering "Drawing 2", importing a picked file). Created lazily by
     /// `app_data`; this accessor only resolves it.
+    ///
+    /// # Errors
+    /// Returns an error where the platform has no application data directory.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     pub fn app_data_dir() -> Result<std::path::PathBuf, DbError> {
         app_data_root()
@@ -97,6 +107,7 @@ impl Sqlite {
     /// A per-connection hook over the raw rusqlite connection: the escape valve for loadable
     /// extensions, custom functions, and PRAGMAs this crate does not model. Native only.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[must_use]
     pub fn with_init(mut self, f: impl Fn(&Connection) + 'static) -> Self {
         self.init = Some(Rc::new(f));
         self
@@ -120,6 +131,7 @@ impl Sqlite {
     /// web-dom a file database's engine runs in the day-sql worker, out of closure reach:
     /// there the statements log to the browser console (`[day-sql]` lines in devtools) and
     /// `f` is not called. `:memory:` databases call `f` on every target.
+    #[must_use]
     pub fn trace_sql(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.trace = Some(Rc::new(f));
         self
@@ -243,9 +255,9 @@ impl SqliteDriver for Sqlite {
             .map_err(|e| DbError::driver(format!("registering day_fold: {e}")))?;
         }
 
-        conn.busy_timeout(std::time::Duration::from_millis(
-            self.opts.busy_timeout_ms as u64,
-        ))
+        conn.busy_timeout(std::time::Duration::from_millis(u64::from(
+            self.opts.busy_timeout_ms,
+        )))
         .map_err(|e| DbError::driver(e.to_string()))?;
         if self.opts.foreign_keys {
             conn.execute_batch("PRAGMA foreign_keys = ON;")
@@ -340,6 +352,10 @@ struct TraceCtx {
 /// Install the engine's per-statement trace on a raw connection handle. rusqlite's own
 /// `trace_v2` takes a plain fn pointer, so the closure rides the C-level context instead.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[expect(
+    clippy::unnecessary_box_returns,
+    reason = "the engine keeps a pointer to the context, so it needs the stable heap address"
+)]
 fn install_sql_trace(conn: &Connection, f: TraceFn) -> Box<TraceCtx> {
     use rusqlite::ffi;
     unsafe extern "C" fn cb(
@@ -403,7 +419,7 @@ fn install_sql_trace(conn: &Connection, f: TraceFn) -> Box<TraceCtx> {
         f,
         last: std::cell::Cell::new((0, -1)),
     });
-    let ctx = &*boxed as *const TraceCtx as *mut std::ffi::c_void;
+    let ctx = &raw const *boxed as *mut std::ffi::c_void;
     // SAFETY: the handle is this connection's own; ctx points into `boxed`, whose heap slot
     // outlives the connection via RusqliteConn::_trace.
     unsafe {
@@ -591,7 +607,7 @@ impl SqliteConnection for RusqliteConn {
                 Ok(Some(r)) => {
                     let n = r.as_ref().column_count();
                     let vals: Vec<Value> = (0..n)
-                        .map(|i| r.get_ref(i).map(from_sql).unwrap_or(Value::Null))
+                        .map(|i| r.get_ref(i).map_or(Value::Null, from_sql))
                         .collect();
                     row(&vals);
                 }
@@ -618,7 +634,11 @@ impl SqliteConnection for RusqliteConn {
             .conn
             .prepare(sql)
             .map_err(|e| DbError::driver(format!("{e} in `{sql}`")))?;
-        let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         let bound = rusqlite::params_from_iter(params.iter().map(to_sql));
         let mut rows = stmt
             .query(bound)
@@ -628,7 +648,7 @@ impl SqliteConnection for RusqliteConn {
                 Ok(Some(r)) => {
                     let n = r.as_ref().column_count();
                     let vals: Vec<Value> = (0..n)
-                        .map(|i| r.get_ref(i).map(from_sql).unwrap_or(Value::Null))
+                        .map(|i| r.get_ref(i).map_or(Value::Null, from_sql))
                         .collect();
                     row(&names, &vals);
                 }

@@ -101,7 +101,7 @@ fn failed_begin_statement_and_commit_preserve_pending_changes_for_retry() {
         let mut title = String::new();
         db.try_with_connection(|c| {
             c.query("SELECT title FROM recovery_books", &[], &mut |r| {
-                title = r.get(0).as_text().unwrap().to_owned()
+                title = r.get(0).as_text().unwrap().to_owned();
             })
         })
         .unwrap();

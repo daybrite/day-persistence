@@ -317,6 +317,10 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Decode one request.
+///
+/// # Errors
+/// Returns [`WireError`] when the bytes are not a well-formed request of this protocol version.
 pub fn decode_req(buf: &[u8]) -> Result<Req, WireError> {
     let mut r = Reader { buf, pos: 0 };
     if r.u8()? != VERSION {
@@ -361,6 +365,10 @@ pub fn decode_req(buf: &[u8]) -> Result<Req, WireError> {
     Ok(req)
 }
 
+/// Decode one reply.
+///
+/// # Errors
+/// Returns [`WireError`] when the bytes are not a well-formed reply.
 pub fn decode_reply(buf: &[u8]) -> Result<Reply, WireError> {
     let mut r = Reader { buf, pos: 0 };
     let reply = match r.u8()? {

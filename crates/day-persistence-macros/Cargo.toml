@@ -16,3 +16,6 @@ proc-macro = true
 # No syn/quote, the same construction as day-macros: the derive reads field names and type
 # tokens and emits Rust as text, so it never has to understand a type, only re-emit it.
 [dependencies]
+
+[lints]
+workspace = true

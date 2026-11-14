@@ -28,7 +28,7 @@ fn temp_db(name: &str) -> std::path::PathBuf {
     path
 }
 
-/// `PRAGMA table_info` on a raw connection: (name, type, notnull, dflt_value, pk).
+/// `PRAGMA table_info` on a raw connection: (name, type, notnull, `dflt_value`, pk).
 fn table_info(
     conn: &rusqlite::Connection,
     table: &str,
@@ -334,13 +334,13 @@ fn an_added_required_column_is_not_null_with_its_rust_default_and_unique_gets_an
     let sink = seen.clone();
     let driver =
         Sqlite::at(&upgraded).trace_sql(move |sql| sink.borrow_mut().push(sql.to_string()));
-    let _c = ModelContainer::open(driver, schema![TaskV2]).expect("reopen");
+    let c = ModelContainer::open(driver, schema![TaskV2]).expect("reopen");
     assert!(
         !seen.borrow().iter().any(|s| is_ddl_write(s)),
         "{:?}",
         seen.borrow()
     );
-    drop(_c);
+    drop(c);
     // A later lightweight change keeps the unique index: it is a declared index of the
     // upgraded layout, not a leftover.
     {
@@ -432,8 +432,11 @@ fn an_old_nullable_addition_is_rebuilt_to_the_declared_constraints_with_data_pre
             0,
             "the NULL the old path tolerated filled from the Rust default"
         );
-        assert!(c.integrity_check().unwrap().is_empty());
-        assert!(c.foreign_key_check().unwrap().is_empty());
+        assert_eq!(c.integrity_check().unwrap(), [] as [std::string::String; 0]);
+        assert_eq!(
+            c.foreign_key_check().unwrap(),
+            [] as [day_persistence::ForeignKeyViolation; 0]
+        );
     }
     let raw = rusqlite::Connection::open(&path).unwrap();
     let info = table_info(&raw, "tasks");
@@ -667,7 +670,7 @@ fn checkpoint_answers_with_the_engines_result() {
     assert!(c.checkpoint().expect("second checkpoint").is_complete());
     let wal = path.with_extension("db-wal");
     assert_eq!(
-        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        std::fs::metadata(&wal).map_or(0, |m| m.len()),
         0,
         "the log was truncated"
     );
@@ -708,6 +711,9 @@ fn foreign_key_check_reports_dangling_rows_and_integrity_check_includes_them() {
     );
     c.with_connection(|conn| conn.execute("INSERT INTO parents (id) VALUES (99)", &[]))
         .expect("repair");
-    assert!(c.foreign_key_check().unwrap().is_empty());
-    assert!(c.integrity_check().unwrap().is_empty());
+    assert_eq!(
+        c.foreign_key_check().unwrap(),
+        [] as [day_persistence::ForeignKeyViolation; 0]
+    );
+    assert_eq!(c.integrity_check().unwrap(), [] as [std::string::String; 0]);
 }

@@ -39,7 +39,7 @@ fn seeded(n: u32) -> (ModelContainer, Rc<RefCell<Vec<String>>>) {
             (1..=n)
                 .map(|i| Rowy {
                     id: i,
-                    bucket: (i % 10) as i64,
+                    bucket: i64::from(i % 10),
                     name: format!("row {i}"),
                 })
                 .collect(),
@@ -84,7 +84,7 @@ fn a_batch_fault_is_one_select() {
         .collect();
     assert_eq!(selects.len(), 1, "fifty rows, one SELECT: {selects:?}");
     assert!(selects[0].contains("IN ("));
-    let resident = c.cache::<Rowy>().with_untracked(|k| k.len());
+    let resident = c.cache::<Rowy>().with_untracked(day_model::Keyed::len);
     assert!(
         (50..=51).contains(&resident),
         "all fifty resident (the limit floor may keep one more): {resident}"
@@ -109,7 +109,7 @@ fn the_cache_stays_bounded_and_faults_back() {
     for chunk in (1..=500u64).collect::<Vec<_>>().chunks(50) {
         c.ensure_resident::<Rowy>(chunk).expect("fault");
     }
-    let resident = store.with_untracked(|k| k.len());
+    let resident = store.with_untracked(day_model::Keyed::len);
     assert!(
         resident <= 64 + 50,
         "the cache respects its bound (a just-faulted batch is protected): {resident}"
@@ -188,7 +188,7 @@ fn a_windowed_query_materializes_only_its_window() {
     c.set_cache_limit(1);
     c.set_cache_limit(usize::MAX);
     let store = c.cache::<Rowy>();
-    let cold = store.with_untracked(|k| k.len());
+    let cold = store.with_untracked(day_model::Keyed::len);
     assert!(
         cold <= 1,
         "cold (the limit floor keeps at most one): {cold}"
@@ -200,10 +200,10 @@ fn a_windowed_query_materializes_only_its_window() {
         .sort(Rowy::id().asc())
         .live();
     assert_eq!(q.count(), 40, "ids only — nothing new resident");
-    assert_eq!(store.with_untracked(|k| k.len()), cold);
+    assert_eq!(store.with_untracked(day_model::Keyed::len), cold);
 
     q.materialize(0..10);
-    let after = store.with_untracked(|k| k.len());
+    let after = store.with_untracked(day_model::Keyed::len);
     assert!(
         (10..=10 + cold).contains(&after),
         "exactly the window faulted: {after}"
@@ -217,7 +217,7 @@ fn table_count_answers_from_the_engine() {
     let (c, _trace) = seeded(123);
     assert_eq!(c.table_count::<Rowy>().expect("count"), 123);
     assert!(
-        c.cache::<Rowy>().with_untracked(|k| k.len()) < 123 || DEFAULT_CACHE_LIMIT >= 123,
+        c.cache::<Rowy>().with_untracked(day_model::Keyed::len) < 123 || DEFAULT_CACHE_LIMIT >= 123,
         "counting did not require residency"
     );
 }
@@ -227,12 +227,15 @@ fn warm_faults_the_whole_table() {
     let (c, trace) = seeded(300);
     c.set_cache_limit(1);
     c.set_cache_limit(usize::MAX);
-    assert!(c.cache::<Rowy>().with_untracked(|k| k.len()) <= 1, "cold");
+    assert!(
+        c.cache::<Rowy>().with_untracked(day_model::Keyed::len) <= 1,
+        "cold"
+    );
     trace.borrow_mut().clear();
 
     let n = c.warm::<Rowy>().expect("warm");
     assert_eq!(n, 300, "the document pattern, one call");
-    assert_eq!(c.cache::<Rowy>().with_untracked(|k| k.len()), 300);
+    assert_eq!(c.cache::<Rowy>().with_untracked(day_model::Keyed::len), 300);
     let selects = trace
         .borrow()
         .iter()

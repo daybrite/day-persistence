@@ -210,17 +210,27 @@ fn closed() -> DbError {
     DbError::new(DbErrorKind::Closed, "database worker is closed")
 }
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    value.lock().unwrap_or_else(|e| e.into_inner())
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 impl DatabaseWorker {
     /// Open/migrate on the owning queue, without blocking the caller's executor. The factory
     /// may create non-Send drivers, schema hooks and model state because it runs on the worker.
+    ///
+    /// # Errors
+    /// Returns the factory's error, or an error when the worker thread cannot start.
     pub async fn open(
         factory: impl FnOnce() -> Result<ModelContainer, DbError> + Send + 'static,
     ) -> Result<Self, DbError> {
         Self::open_with(WorkerOptions::default(), factory).await
     }
 
+    /// [`DatabaseWorker::open`], with a queue capacity and thread name.
+    ///
+    /// # Errors
+    /// Returns a `Busy` error for a zero capacity, the factory's error, or an error when the worker
+    /// thread cannot start.
     pub async fn open_with(
         options: WorkerOptions,
         factory: impl FnOnce() -> Result<ModelContainer, DbError> + Send + 'static,
@@ -348,7 +358,7 @@ impl DatabaseWorker {
         write: impl FnOnce(&ModelContainer) -> Result<R, DbError> + Send + 'static,
     ) -> WorkerRequest<R> {
         self.submit(false, move |session| {
-            let checkpoint = session.undo.as_ref().map(|undo| undo.checkpoint());
+            let checkpoint = session.undo.as_ref().map(day_model::UndoStack::checkpoint);
             let group = session.undo.as_ref().map(|undo| undo.begin_group("edit"));
             let result = session.db.worker_write_origin(origin, write);
             drop(group); // Seal even when no UI observer caused a reactive turn-end drain.
@@ -370,7 +380,7 @@ impl DatabaseWorker {
         write: impl FnOnce(&ModelContainer) -> Result<R, DbError> + Send + 'static,
     ) -> WorkerRequest<R> {
         self.submit(false, move |session| {
-            let checkpoint = session.undo.as_ref().map(|undo| undo.checkpoint());
+            let checkpoint = session.undo.as_ref().map(day_model::UndoStack::checkpoint);
             let result = session
                 .db
                 .worker_write(|db| day_model::with_author("reset", || write(db)));
@@ -433,6 +443,9 @@ impl DatabaseWorker {
     /// Observe an owned projection after committed writes. The projection must be read-only;
     /// it runs on the database queue. Registration participates in FIFO admission, so the first
     /// result includes all writes accepted before it. Subsequent results may coalesce revisions.
+    ///
+    /// # Errors
+    /// Returns an error when the worker has closed or stopped before the registration ran.
     pub async fn observe<T: Clone + PartialEq + Send + 'static>(
         &self,
         project: impl Fn(&ModelContainer) -> Result<T, DbError> + Send + 'static,
@@ -568,6 +581,10 @@ impl DatabaseWorker {
     /// Normal application code should use `close().await`. This waits for every accepted
     /// operation and may take as long as the longest transaction. Never call it while holding
     /// a lock a submitted operation needs. Calling it from this worker is rejected.
+    ///
+    /// # Errors
+    /// Returns the error the worker stopped with, or a driver error when called from the worker
+    /// itself.
     pub fn close_blocking(&self) -> Result<(), DbError> {
         struct Unpark(std::thread::Thread);
         impl std::task::Wake for Unpark {
@@ -588,6 +605,10 @@ impl DatabaseWorker {
 
     /// Stop admission for every clone, drain accepted writes, and close on the owning queue.
     /// No join or disk flush blocks the caller. Repeated close calls share completion.
+    ///
+    /// # Errors
+    /// Returns the error the worker stopped with, or a driver error when called from the worker
+    /// itself.
     pub async fn close(&self) -> Result<(), DbError> {
         let (deliver, receiver) = day_async::oneshot();
         {

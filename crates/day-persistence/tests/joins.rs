@@ -80,7 +80,7 @@ fn notes_app(path: Option<&std::path::Path>) -> Notes {
                 id: id as u32,
                 name: name.into(),
                 ..Default::default()
-            })
+            });
         });
     }
     let notes = c.cache::<Note>();
@@ -91,7 +91,7 @@ fn notes_app(path: Option<&std::path::Path>) -> Notes {
                 id: *id,
                 title: format!("note {i}"),
                 ..Default::default()
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -300,7 +300,7 @@ fn catalog() -> ModelContainer {
                 id: id as u32,
                 code: code.into(),
                 ..Default::default()
-            })
+            });
         });
     }
     let readings = c.cache::<Reading>();
@@ -309,7 +309,7 @@ fn catalog() -> ModelContainer {
             v.push(Reading {
                 id: id as u32,
                 title: title.into(),
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -355,7 +355,7 @@ fn an_ordered_join_survives_a_reopen_in_order() {
                 id: 1,
                 code: "CS101".into(),
                 ..Default::default()
-            })
+            });
         });
         let readings = c.cache::<Reading>();
         for id in [10u32, 11, 12] {
@@ -363,7 +363,7 @@ fn an_ordered_join_survives_a_reopen_in_order() {
                 v.push(Reading {
                     id,
                     title: format!("r{id}"),
-                })
+                });
             });
             courses.elem(1).readings().add(id);
         }
@@ -445,7 +445,7 @@ fn a_join_deny_refuses_while_memberships_remain() {
         v.push(Title {
             id: 5,
             name: "Dune".into(),
-        })
+        });
     });
     c.cache::<Shelf>().elem(1).titles().add(5u32);
 
@@ -484,7 +484,7 @@ fn a_join_cascade_deletes_only_the_children_nobody_else_holds() {
             v.push(Album {
                 id,
                 ..Default::default()
-            })
+            });
         });
     }
     for id in [10u32, 11] {
@@ -492,7 +492,7 @@ fn a_join_cascade_deletes_only_the_children_nobody_else_holds() {
             v.push(Photo {
                 id,
                 caption: format!("p{id}"),
-            })
+            });
         });
     }
     albums.elem(1).photos().add(10u32);

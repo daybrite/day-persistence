@@ -343,7 +343,7 @@ fn a_match_inside_a_relation_predicate_searches_the_target_table() {
         .iter()
         .map(|i| i.handle())
         .collect();
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [u64; 0]);
 
     // Composed with a local predicate, as the reader's search box does.
     let either: Vec<u64> = c
@@ -629,7 +629,7 @@ fn updating_a_non_indexed_column_leaves_the_fts_index_untouched() {
     });
     c.save().expect("seed flush");
     let before = fts_segments(&c, "posts");
-    assert!(!before.is_empty());
+    assert_ne!(before, [] as [(i64, std::vec::Vec<u8>); 0]);
     let q = c
         .query::<Post>()
         .filter(Post::fts().matches("kyoto"))
@@ -684,12 +684,12 @@ fn updating_a_non_indexed_column_leaves_the_fts_index_untouched() {
             .ids(),
         [1]
     );
-    assert!(
+    assert_eq!(
         c.query::<Post>()
             .filter(Post::fts().matches("kyoto"))
             .live()
-            .ids()
-            .is_empty()
+            .ids(),
+        [] as [day_model::ModelId<Post>; 0]
     );
 }
 
@@ -787,12 +787,12 @@ fn changed_content_is_searchable_after_update_and_reopen_and_not_after_rollback(
         [2],
         "the change survives a reopen"
     );
-    assert!(
+    assert_eq!(
         c.query::<Post>()
             .filter(Post::fts().matches("osaka"))
             .live()
-            .ids()
-            .is_empty()
+            .ids(),
+        [] as [day_model::ModelId<Post>; 0]
     );
     // A rolled-back update takes its index maintenance with it.
     c.with_connection(|conn| {

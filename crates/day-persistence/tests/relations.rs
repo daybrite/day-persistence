@@ -145,14 +145,14 @@ fn travel() -> ModelContainer {
             id: 1,
             name: "Kyoto".into(),
             ..Default::default()
-        })
+        });
     });
     trips.restructure("add", Op::Insert, 2, |v| {
         v.push(Trip {
             id: 2,
             name: "Oslo".into(),
             ..Default::default()
-        })
+        });
     });
     let lodging = c.cache::<Lodging>();
     for (id, name, trip) in [
@@ -165,7 +165,7 @@ fn travel() -> ModelContainer {
                 id: id as u32,
                 name: name.into(),
                 trip: One::to(trip as u32),
-            })
+            });
         });
     }
     // Land the setup, so a `record_sql` below sees only the operation under test.
@@ -323,9 +323,9 @@ fn a_mid_batch_parent_delete_spares_the_children_the_batch_detached() {
 
     // One batch, the app's ungroup: detach each child (parent + a fresh z), delete the group.
     for (i, child) in [2u32, 3u32].into_iter().enumerate() {
-        layers.elem(child as u64).parent().write(None);
+        layers.elem(u64::from(child)).parent().write(None);
         layers
-            .elem(child as u64)
+            .elem(u64::from(child))
             .z()
             .write(1.0 + (i as f64 + 1.0) / 1024.0);
     }
@@ -375,7 +375,7 @@ fn nullify_clears_optional_references_and_the_children_survive() {
             id: 1,
             name: "Le Guin".into(),
             ..Default::default()
-        })
+        });
     });
     for (id, title) in [(10, "Dispossessed"), (11, "Left Hand")] {
         books.restructure("add", Op::Insert, id, |v| {
@@ -383,7 +383,7 @@ fn nullify_clears_optional_references_and_the_children_survive() {
                 id: id as u32,
                 title: title.into(),
                 author: Some(One::to(1u32)),
-            })
+            });
         });
     }
     assert_eq!(authors.elem(1).books().count(), 2);
@@ -415,14 +415,14 @@ fn deny_refuses_through_the_checked_door() {
             id: 1,
             number: "INV-0001".into(),
             ..Default::default()
-        })
+        });
     });
     items.restructure("add", Op::Insert, 10, |v| {
         v.push(LineItem {
             id: 10,
             what: "consulting".into(),
             invoice: One::to(1u32),
-        })
+        });
     });
 
     let err = c.delete::<Invoice>(1u32).expect_err("still referenced");
@@ -446,7 +446,7 @@ fn ordered_children_read_in_order_and_a_move_writes_one_row() {
             id: 1,
             title: "Road trip".into(),
             ..Default::default()
-        })
+        });
     });
     for (id, title) in [(10, "Opening"), (11, "Middle"), (12, "Closer")] {
         tracks.restructure("add", Op::Insert, id, |v| {
@@ -455,7 +455,7 @@ fn ordered_children_read_in_order_and_a_move_writes_one_row() {
                 title: title.into(),
                 playlist: One::to(1u32),
                 position: 0.0,
-            })
+            });
         });
         // Append through the relation, so positions assign.
         lists.elem(1).tracks().add(id as u32);
@@ -484,7 +484,7 @@ fn a_spent_gap_rebalances_and_order_stays_true() {
             id: 1,
             title: "Bisection".into(),
             ..Default::default()
-        })
+        });
     });
     for id in 10..14u32 {
         tracks.restructure("add", Op::Insert, id, |v| {
@@ -493,7 +493,7 @@ fn a_spent_gap_rebalances_and_order_stays_true() {
                 title: format!("t{id}"),
                 playlist: One::to(1u32),
                 position: 0.0,
-            })
+            });
         });
         lists.elem(1).tracks().add(id);
     }
@@ -539,14 +539,14 @@ fn an_external_cascade_merges_cleanly() {
             id: 1,
             name: "Kyoto".into(),
             ..Default::default()
-        })
+        });
     });
     lodging.restructure("add", Op::Insert, 10, |v| {
         v.push(Lodging {
             id: 10,
             name: "Ryokan".into(),
             trip: One::to(1u32),
-        })
+        });
     });
     c.save().expect("save");
 
@@ -593,14 +593,14 @@ fn travel_at(path: &std::path::Path) -> ModelContainer {
             id: 1,
             name: "Kyoto".into(),
             ..Default::default()
-        })
+        });
     });
     trips.restructure("add", Op::Insert, 2, |v| {
         v.push(Trip {
             id: 2,
             name: "Oslo".into(),
             ..Default::default()
-        })
+        });
     });
     let lodging = c.cache::<Lodging>();
     for (id, name, trip) in [
@@ -613,13 +613,17 @@ fn travel_at(path: &std::path::Path) -> ModelContainer {
                 id: id as u32,
                 name: name.into(),
                 trip: One::to(trip as u32),
-            })
+            });
         });
     }
     c
 }
 
 #[test]
+#[expect(
+    clippy::items_after_statements,
+    reason = "each miswired model sits beside the assertion that names its problem"
+)]
 fn wiring_validations_name_the_problem() {
     // The relation's target is not in the schema.
     let err = ModelContainer::open(Sqlite::memory(), schema![Trip])
@@ -705,7 +709,7 @@ fn a_dangling_reference_reads_as_a_missing_parent() {
             id: 99,
             name: "Orphan".into(),
             trip: One::to(777u32),
-        })
+        });
     });
     let parent = lodging.elem(99).trip().peek().id().expect("set");
     assert!(!trips.elem(parent).exists(), "deleted-row semantics apply");
@@ -754,7 +758,7 @@ fn a_renamed_foreign_key_column_still_wires_and_folds() {
                 v.push(Crate {
                     id,
                     ..Default::default()
-                })
+                });
             });
         }
         c.cache::<Bottle>().restructure("add", Op::Insert, 10, |v| {
@@ -762,7 +766,7 @@ fn a_renamed_foreign_key_column_still_wires_and_folds() {
                 id: 10,
                 label: "Riesling".into(),
                 holder: One::to(1u32),
-            })
+            });
         });
         c.save().expect("seed");
         assert_eq!(crates.elem(1).bottles().ids(), [10]);
@@ -804,7 +808,7 @@ fn ordered_edges_place_correctly() {
             id: 1,
             title: "Edges".into(),
             ..Default::default()
-        })
+        });
     });
     let add = |id: u32| {
         tracks.restructure("add", Op::Insert, id, |v| {
@@ -813,7 +817,7 @@ fn ordered_edges_place_correctly() {
                 title: format!("t{id}"),
                 playlist: One::to(1u32),
                 position: 0.0,
-            })
+            });
         });
     };
 
@@ -855,7 +859,7 @@ fn a_self_referential_cascade_flushes_as_one_statement() {
                 name: format!("n{i}"),
                 parent,
                 ..Default::default()
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -880,7 +884,7 @@ fn the_engines_own_cascade_is_traced_as_frames() {
     // Diagnosing a report of "the same DELETE five times" in a trace: the fold wrote one
     // statement, and the engine's cascade inside it must not read as four more.
     let path = temp_db("trace-cascade");
-    let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::default();
     let sink = seen.clone();
     let c = ModelContainer::open(
         Sqlite::at(&path).trace_sql(move |s| sink.borrow_mut().push(s.to_string())),
@@ -897,7 +901,7 @@ fn the_engines_own_cascade_is_traced_as_frames() {
                 name: format!("n{i}"),
                 parent,
                 ..Default::default()
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -951,7 +955,11 @@ fn the_engines_own_cascade_is_traced_as_frames() {
 
 /// Lowercase hex, for comparing against SQLite's `x'…'` blob literals in a trace.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 #[test]
@@ -1014,7 +1022,7 @@ fn a_batched_update_reaches_the_file_for_every_row() {
                     id,
                     name: "before".into(),
                     ..Default::default()
-                })
+                });
             });
         }
         c.save().expect("seed");
@@ -1047,7 +1055,7 @@ fn a_join_rows_composite_key_keeps_its_own_statement() {
             v.push(Crate2 {
                 id: 1,
                 ..Default::default()
-            })
+            });
         });
     for id in [10u32, 11] {
         c.cache::<Bottle2>()
@@ -1055,7 +1063,7 @@ fn a_join_rows_composite_key_keeps_its_own_statement() {
                 v.push(Bottle2 {
                     id,
                     label: format!("b{id}"),
-                })
+                });
             });
         c.cache::<Crate2>().elem(1u32).bottles().add(id);
     }

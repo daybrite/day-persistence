@@ -21,3 +21,11 @@ accessibility labels to controls. Keep synthetic test values distinct from shipp
 
 Do not edit vendored SQLite/musl sources or generated bindings as routine cleanup. Preserve
 upstream licenses and document deliberate engine upgrades.
+
+## Lint policy
+
+`Cargo.toml` turns on Clippy's `pedantic` group, and CI treats every warning as an error. Fix a
+finding in the code; do not add `#[allow]`. Where a fix would change public API or behavior, or
+the lint is wrong for that site, put `#[expect(clippy::<lint>, reason = "…")]` on the narrowest
+item, with one specific sentence of reason. Leave the lint table unchanged unless the owner
+asks.

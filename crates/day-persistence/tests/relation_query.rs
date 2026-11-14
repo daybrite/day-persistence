@@ -109,7 +109,7 @@ fn seed_travel(driver: Sqlite) -> ModelContainer {
                 name: name.into(),
                 done,
                 ..Default::default()
-            })
+            });
         });
     }
     let lodging = c.cache::<Lodging>();
@@ -125,7 +125,7 @@ fn seed_travel(driver: Sqlite) -> ModelContainer {
                 confirmed,
                 notes: "quiet".into(),
                 trip: One::to(trip),
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -183,7 +183,7 @@ fn none_and_all_differ_exactly_over_the_empty_relation() {
             confirmed: false,
             notes: String::new(),
             trip: One::to(3u32),
-        })
+        });
     });
     assert_eq!(
         trip_ids(&c, Trip::lodging().all(Lodging::confirmed().eq(true))),
@@ -344,9 +344,9 @@ fn inserting_and_deleting_a_related_row_moves_its_parent() {
             confirmed: false,
             notes: String::new(),
             trip: One::to(3u32),
-        })
+        });
     });
-    assert!(q.ids().is_empty());
+    assert_eq!(q.ids(), [] as [day_model::ModelId<Trip>; 0]);
 
     // …and comes back when it loses it. The deletion has to resolve to its parent before the
     // relation index forgets the row, which is the ordering hazard this pins.
@@ -393,7 +393,7 @@ fn tagged() -> Notes {
                 id,
                 name: name.into(),
                 ..Default::default()
-            })
+            });
         });
     }
     let notes = c.cache::<Note>();
@@ -408,7 +408,7 @@ fn tagged() -> Notes {
                     format!("Note {i}")
                 },
                 ..Default::default()
-            })
+            });
         });
     }
     tags.elem(1).notes().add(ids[0]);
@@ -544,7 +544,7 @@ fn a_self_referential_relation_traverses_both_ways() {
                 name: name.into(),
                 parent: parent.map(One::to),
                 ..Default::default()
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -590,7 +590,7 @@ fn nesting_compiles_to_nested_exists_and_stays_live() {
                 name: name.into(),
                 parent: parent.map(One::to),
                 ..Default::default()
-            })
+            });
         });
     }
     c.save().expect("seed");
@@ -615,7 +615,7 @@ fn nesting_compiles_to_nested_exists_and_stays_live() {
 
     // The result stays correct across a change either way.
     c.cache::<Node>().elem(1).name().write("trunk".into());
-    assert!(q.ids().is_empty());
+    assert_eq!(q.ids(), [] as [day_model::ModelId<Node>; 0]);
 }
 
 #[test]

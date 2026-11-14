@@ -35,3 +35,6 @@ cc = { workspace = true }
 [package.metadata.day.web]
 modules = ["web/day-sql.js"]
 files = ["web/day-sql-worker.js"]
+
+[lints]
+workspace = true

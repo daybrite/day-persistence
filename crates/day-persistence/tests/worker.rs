@@ -54,7 +54,7 @@ fn note(id: u64) -> Note {
     }
 }
 fn count(w: &DatabaseWorker) -> u64 {
-    block_on(w.read(|db| db.table_count::<Note>())).unwrap()
+    block_on(w.read(day_persistence::ModelContainer::table_count::<Note>)).unwrap()
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn fifo_and_read_your_writes_work_without_awaiting_each_submission() {
             Ok(())
         }));
     }
-    let counted = w.read(|db| db.table_count::<Note>());
+    let counted = w.read(day_persistence::ModelContainer::table_count::<Note>);
     for r in pending {
         block_on(r).unwrap();
     }
@@ -276,7 +276,7 @@ fn panic_closes_worker_and_completes_queued_requests() {
         db.insert(note(1));
         panic!("synthetic worker failure")
     });
-    let after = w.read(|db| db.table_count::<Note>());
+    let after = w.read(day_persistence::ModelContainer::table_count::<Note>);
     assert_eq!(block_on(bad).unwrap_err().kind, DbErrorKind::Panicked);
     assert!(block_on(after).is_err());
     assert!(block_on(w.close()).is_err());
@@ -336,7 +336,8 @@ fn clones_serialize_concurrent_updates_without_lost_writes() {
 #[test]
 fn observations_deliver_committed_values_and_monotonic_revisions() {
     let w = open();
-    let mut subscription = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut subscription =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     let first = block_on(subscription.next()).unwrap().unwrap();
     assert_eq!(first.value, 0);
     block_on(w.write(|db| {
@@ -353,7 +354,8 @@ fn observations_deliver_committed_values_and_monotonic_revisions() {
 #[test]
 fn observations_coalesce_a_slow_consumer_and_do_not_hold_worker_alive() {
     let w = open();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     assert_eq!(block_on(sub.next()).unwrap().unwrap().value, 0);
     for id in 0..100 {
         block_on(w.write(move |db| {
@@ -369,7 +371,8 @@ fn observations_coalesce_a_slow_consumer_and_do_not_hold_worker_alive() {
 #[test]
 fn failed_transactions_never_publish_speculative_values() {
     let w = open();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     assert_eq!(block_on(sub.next()).unwrap().unwrap().value, 0);
     assert!(
         block_on(w.write::<()>(|db| {
@@ -385,7 +388,8 @@ fn failed_transactions_never_publish_speculative_values() {
 #[test]
 fn unchanged_projections_do_not_wake_the_consumer() {
     let w = open();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     block_on(sub.next()).unwrap().unwrap();
     for _ in 0..20 {
         block_on(w.write(|_| Ok(()))).unwrap();
@@ -523,15 +527,15 @@ fn fts_and_cache_restore_after_failed_delete_and_update() {
     }))
     .unwrap();
     assert_eq!(hits.len(), 2);
-    assert!(
+    assert_eq!(
         block_on(w.read(|db| {
             db.query::<Note>()
                 .filter(Note::fts().matches("rollbackword"))
                 .live()
                 .try_collect()
         }))
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        [] as [Note; 0]
     );
     block_on(w.close()).unwrap();
 }
@@ -586,7 +590,8 @@ fn dropping_last_handle_drains_accepted_writes_and_releases_subscription() {
         ModelContainer::open(Sqlite::at(path), schema![Note])
     }))
     .unwrap();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     for id in 0..100 {
         drop(w.write(move |db| {
             db.insert(note(id));
@@ -608,7 +613,8 @@ fn external_commits_are_merged_on_worker_and_publish_new_revision() {
         ModelContainer::open(Sqlite::at(path), schema![Note])
     }))
     .unwrap();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     block_on(sub.next()).unwrap().unwrap();
     let db = ModelContainer::open(Sqlite::at(&file), schema![Note]).unwrap();
     db.insert(note(1));
@@ -797,13 +803,9 @@ fn cancellation_and_failed_transactions_stress_preserve_exact_committed_state() 
                     Ok(())
                 }
             }));
-            drop(w.read(|db| db.table_count::<Note>()));
+            drop(w.read(day_persistence::ModelContainer::table_count::<Note>));
         }
-        let committed = requests
-            .into_iter()
-            .map(block_on)
-            .filter(Result::is_ok)
-            .count();
+        let committed = requests.into_iter().flat_map(block_on).count();
         assert_eq!(count(&w), committed as u64);
         w.close_blocking().unwrap();
     }
@@ -942,7 +944,8 @@ fn failed_rollback_closes_connection_on_owner_thread_and_rejects_further_work() 
 #[test]
 fn projection_recovery_failure_reports_error_then_ends_subscription() {
     let (w, fail, dropped) = fault_worker();
-    let mut sub = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut sub =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     assert_eq!(block_on(sub.next()).unwrap().unwrap().value, 0);
     fail.store(2, std::sync::atomic::Ordering::SeqCst);
     block_on(w.write(|db| {
@@ -1102,7 +1105,7 @@ fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_at
         db.try_with_connection(|c| {
             let mut out = vec![];
             c.query("SELECT n,origin FROM audit", &[], &mut |r| {
-                out.push((r.get(0), r.get(1)))
+                out.push((r.get(0), r.get(1)));
             })?;
             Ok(out)
         })
@@ -1128,7 +1131,7 @@ fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_at
         db.try_with_connection(|c| {
             let mut rows = vec![];
             c.query("SELECT n,origin FROM audit", &[], &mut |r| {
-                rows.push((r.get(0), r.get(1)))
+                rows.push((r.get(0), r.get(1)));
             })?;
             assert_eq!(
                 rows,
@@ -1138,7 +1141,7 @@ fn transaction_participant_covers_intermediate_saves_reactions_and_rolls_back_at
                 ]
             );
             c.query("SELECT count(*) FROM audit_begin", &[], &mut |r| {
-                assert_eq!(r.get(0), Value::Int(2))
+                assert_eq!(r.get(0), Value::Int(2));
             })?;
             Ok(())
         })
@@ -1230,7 +1233,8 @@ fn committed_refresh_failure_preserves_revision_and_undo_including_reset() {
     }))
     .unwrap();
     block_on(w.enable_undo(10)).unwrap();
-    let mut observed = block_on(w.observe(|db| db.table_count::<Note>())).unwrap();
+    let mut observed =
+        block_on(w.observe(day_persistence::ModelContainer::table_count::<Note>)).unwrap();
     assert_eq!(block_on(observed.next()).unwrap().unwrap().revision, 0);
     let err = block_on(w.write(|db| {
         db.insert(note(1));
@@ -1375,7 +1379,7 @@ fn direct_save_refresh_failure_does_not_rejournal_the_already_committed_edit() {
         db.save().unwrap();
         db.try_with_connection(|c| {
             c.query("SELECT count(*) FROM committed_once", &[], &mut |r| {
-                assert_eq!(r.get(0), day_persistence::Value::Int(1))
+                assert_eq!(r.get(0), day_persistence::Value::Int(1));
             })
         })
         .unwrap();

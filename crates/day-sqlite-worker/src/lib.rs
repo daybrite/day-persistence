@@ -16,7 +16,7 @@
 //!
 //! One wasm, two instantiations. The **app instance** may use [`Connection::open_memory`]
 //! in-process (`:memory:` engines never touch a file) and reaches file databases through
-//! `channel`. The **worker instance** services the SharedArrayBuffer channel: the worker
+//! `channel`. The **worker instance** services the `SharedArrayBuffer` channel: the worker
 //! page copies each request into wasm memory and calls [`day_sql_exec`], which runs it
 //! against real OPFS files through the day-opfs VFS and returns the reply bytes. The
 //! [`protocol`] module is the wire format both sides share.
@@ -33,7 +33,8 @@
     non_snake_case,
     dead_code,
     improper_ctypes,
-    clippy::all
+    clippy::all,
+    clippy::pedantic
 )]
 #[rustfmt::skip]
 mod bindings;
@@ -77,8 +78,7 @@ mod os {
         pub fn now_ms() -> f64 {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0)
+                .map_or(0.0, |d| d.as_millis() as f64)
         }
         pub fn log_line(s: &str) {
             log::warn!("[day-sql] {s}");
@@ -148,6 +148,10 @@ const ALIGN: usize = core::mem::size_of::<usize>() * 2;
 /// # Safety
 /// C `malloc` contract; the size is stored ahead of the returned block for `free`/`realloc`.
 #[no_mangle]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the block comes from the allocator with `ALIGN` alignment"
+)]
 pub unsafe extern "C" fn rust_sqlite_wasm_malloc(size: usize) -> *mut c_void {
     let layout = core::alloc::Layout::from_size_align_unchecked(size + ALIGN, ALIGN);
     let ptr = std::alloc::alloc(layout);
@@ -161,6 +165,10 @@ pub unsafe extern "C" fn rust_sqlite_wasm_malloc(size: usize) -> *mut c_void {
 /// # Safety
 /// Only pointers from `rust_sqlite_wasm_malloc`/`realloc`.
 #[no_mangle]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the block comes from the allocator with `ALIGN` alignment"
+)]
 pub unsafe extern "C" fn rust_sqlite_wasm_free(ptr: *mut c_void) {
     let ptr: *mut u8 = ptr.sub(ALIGN).cast();
     let size = *(ptr.cast::<usize>());
@@ -171,6 +179,10 @@ pub unsafe extern "C" fn rust_sqlite_wasm_free(ptr: *mut c_void) {
 /// # Safety
 /// Only pointers from `rust_sqlite_wasm_malloc`/`realloc`.
 #[no_mangle]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the block comes from the allocator with `ALIGN` alignment"
+)]
 pub unsafe extern "C" fn rust_sqlite_wasm_realloc(
     ptr: *mut c_void,
     new_size: usize,
@@ -210,6 +222,9 @@ pub unsafe extern "C" fn rust_sqlite_wasm_getentropy(buf: *mut u8, buf_len: usiz
 
 /// # Safety
 /// C `__assert_fail` contract; an assertion in the C tree is a bug worth stopping on.
+///
+/// # Panics
+/// Always: it reports the failed assertion.
 #[no_mangle]
 pub unsafe extern "C" fn rust_sqlite_wasm_assert_fail(
     expr: *const c_char,
@@ -234,6 +249,10 @@ pub unsafe extern "C" fn rust_sqlite_wasm_abort() -> ! {
 
 /// musl's `struct tm` (what `<time.h>` in the vendored headers declares).
 #[repr(C)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields carry the names of C `struct tm`"
+)]
 pub struct Tm {
     tm_sec: c_int,
     tm_min: c_int,
@@ -252,6 +271,7 @@ pub struct Tm {
 /// exists in the browser sandbox, so SQLite's `'localtime'` modifier resolves to UTC here;
 /// apps that need the viewer's zone format in the UI layer, where the platform knows it.
 fn utc_breakdown(t: i64) -> Tm {
+    const CUM: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let days = t.div_euclid(86_400);
     let secs = t.rem_euclid(86_400);
     let z = days + 719_468;
@@ -264,7 +284,6 @@ fn utc_breakdown(t: i64) -> Tm {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    const CUM: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let yday = CUM[(m - 1) as usize] + i64::from(leap && m > 2) + d - 1;
     Tm {
         tm_sec: (secs % 60) as c_int,
@@ -283,7 +302,7 @@ fn utc_breakdown(t: i64) -> Tm {
 
 /// # Safety
 /// C `localtime` contract: returns a shared static buffer, single-threaded callers only,
-/// which this engine is by construction (SQLITE_THREADSAFE=0).
+/// which this engine is by construction (`SQLITE_THREADSAFE=0`).
 #[no_mangle]
 pub unsafe extern "C" fn rust_sqlite_wasm_localtime(t: *const i64) -> *mut Tm {
     static mut TM: Tm = Tm {
@@ -305,7 +324,7 @@ pub unsafe extern "C" fn rust_sqlite_wasm_localtime(t: *const i64) -> *mut Tm {
 }
 
 /// # Safety
-/// Called once by `sqlite3_initialize` (SQLITE_OS_OTHER contract): registers day-mem
+/// Called once by `sqlite3_initialize` (`SQLITE_OS_OTHER` contract): registers day-mem
 /// (default) and day-opfs.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_os_init() -> c_int {
@@ -394,9 +413,9 @@ impl Connection {
         let rc = unsafe {
             b::sqlite3_open_v2(
                 path.as_ptr(),
-                &mut db,
+                &raw mut db,
                 flags,
-                vfs.map_or(core::ptr::null(), |v| v.as_ptr()),
+                vfs.map_or(core::ptr::null(), std::ffi::CStr::as_ptr),
             )
         };
         if rc != b::SQLITE_OK {
@@ -412,11 +431,11 @@ impl Connection {
         Ok(Connection { db, trace: None })
     }
 
-    /// Install the engine's per-statement trace (`sqlite3_trace_v2`, SQLITE_TRACE_STMT): `f`
+    /// Install the engine's per-statement trace (`sqlite3_trace_v2`, `SQLITE_TRACE_STMT)`: `f`
     /// sees every statement this connection executes, with bound parameters expanded.
     pub fn trace_stmt(&mut self, f: TraceFn) {
         let boxed: Box<TraceFn> = Box::new(f);
-        let ctx = &*boxed as *const TraceFn as *mut core::ffi::c_void;
+        let ctx = &raw const *boxed as *mut core::ffi::c_void;
         // SAFETY: ctx points into `boxed`, stored on self below, so it is stable while the
         // engine holds it, and cleared implicitly when the connection closes.
         unsafe {
@@ -426,17 +445,26 @@ impl Connection {
     }
 
     /// A private in-memory database, the only kind the main-thread app instance may open.
+    ///
+    /// # Errors
+    /// Returns the engine error when the database cannot be opened.
     pub fn open_memory() -> Result<Connection, SqlError> {
         Self::open_with(":memory:", None)
     }
 
     /// A named database through the day-opfs VFS (real OPFS in the worker, the in-memory
     /// fake in native tests).
+    ///
+    /// # Errors
+    /// Returns the engine error when the database cannot be opened.
     pub fn open_opfs(name: &str) -> Result<Connection, SqlError> {
         Self::open_with(name, Some(vfs::OPFS_VFS))
     }
 
     /// Run semicolon-separated statements with no parameters and no rows.
+    ///
+    /// # Errors
+    /// Returns the engine error of the first statement that fails to prepare or run.
     pub fn execute_batch(&self, sql: &str) -> Result<(), SqlError> {
         let mut rest = sql.as_bytes();
         while !rest.is_empty() {
@@ -447,7 +475,7 @@ impl Connection {
             };
             let rc = loop {
                 match unsafe { b::sqlite3_step(stmt.0) } {
-                    b::SQLITE_ROW => continue,
+                    b::SQLITE_ROW => {}
                     code => break code,
                 }
             };
@@ -461,6 +489,9 @@ impl Connection {
     }
 
     /// Run one statement; the count of changed rows comes back.
+    ///
+    /// # Errors
+    /// Returns the engine error when the statement is empty, or fails to prepare, bind or run.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, SqlError> {
         let (stmt, _) = self.prepare(sql.as_bytes())?;
         let stmt = stmt.ok_or_else(|| err(1, "empty statement"))?;
@@ -472,6 +503,9 @@ impl Connection {
     }
 
     /// Run one statement, delivering each row to `f`.
+    ///
+    /// # Errors
+    /// Returns the engine error when the statement is empty, or fails to prepare, bind or run.
     pub fn query(
         &self,
         sql: &str,
@@ -483,6 +517,9 @@ impl Connection {
     }
 
     /// Query with result column names, including aliases. Names are returned even for no rows.
+    ///
+    /// # Errors
+    /// Returns the engine error when the statement is empty, or fails to prepare, bind or run.
     pub fn query_named(
         &self,
         sql: &str,
@@ -548,8 +585,8 @@ impl Connection {
                 self.db,
                 sql.as_ptr().cast(),
                 sql.len() as c_int,
-                &mut stmt,
-                &mut tail,
+                &raw mut stmt,
+                &raw mut tail,
             )
         };
         if rc != b::SQLITE_OK {
@@ -695,14 +732,14 @@ fn dispatch(req: Req) -> Reply {
             CONNS.with(|c| c.borrow_mut().remove(&conn));
             Reply::Ok
         }
-        Req::Batch { conn, sql } => with_conn(conn, |c| c.execute_batch(&sql).map(|_| Reply::Ok)),
+        Req::Batch { conn, sql } => with_conn(conn, |c| c.execute_batch(&sql).map(|()| Reply::Ok)),
         Req::Exec { conn, sql, params } => {
             with_conn(conn, |c| c.execute(&sql, &params).map(Reply::Changes))
         }
         Req::Query { conn, sql, params } => with_conn(conn, |c| {
             let mut rows = Vec::new();
             c.query(&sql, &params, &mut |row| rows.push(row))
-                .map(|_| Reply::Rows(rows))
+                .map(|()| Reply::Rows(rows))
         }),
         Req::QueryNamed { conn, sql, params } => with_conn(conn, |c| {
             let mut rows = Vec::new();
@@ -760,6 +797,10 @@ pub extern "C" fn day_sql_alloc(len: usize) -> *mut u8 {
 /// transfers here. Returns a pointer to `[reply_len: u32 LE][reply bytes]`, valid until the
 /// next call.
 #[no_mangle]
+#[expect(
+    clippy::same_length_and_capacity,
+    reason = "`day_sql_alloc(len)` allocates exactly `len` bytes, which the page then fills"
+)]
 pub unsafe extern "C" fn day_sql_exec(ptr: *mut u8, len: usize) -> *const u8 {
     let req = Vec::from_raw_parts(ptr, len, len);
     let reply = handle_request(&req);
@@ -785,9 +826,15 @@ mod tests {
     static ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn engine() -> std::sync::MutexGuard<'static, ()> {
-        ENGINE.lock().unwrap_or_else(|e| e.into_inner())
+        ENGINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "every test builds its request in the call"
+    )]
     fn ask(req: Req) -> Reply {
         protocol::decode_reply(&handle_request(&protocol::encode_req(&req))).expect("well-formed")
     }
@@ -1215,9 +1262,9 @@ mod tests {
 
     #[test]
     fn trace_stmt_sees_every_statement_with_parameters_expanded() {
-        let _engine = engine();
         use std::cell::RefCell;
         use std::rc::Rc;
+        let _engine = engine();
         let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = seen.clone();
         let mut conn = Connection::open_memory().expect("open");

@@ -383,6 +383,10 @@ fn a_gap_in_the_stages_is_an_error() {
 }
 
 #[test]
+#[expect(
+    clippy::items_after_statements,
+    reason = "each variant model sits beside the assertion that compares it"
+)]
 fn fingerprints_answer_to_every_declared_detail() {
     // Same model, twice: stable.
     assert_eq!(

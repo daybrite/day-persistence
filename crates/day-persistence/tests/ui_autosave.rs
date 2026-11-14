@@ -191,11 +191,11 @@ fn a_query_backed_list_takes_a_native_move_as_its_echo() {
         let (ids, refuse) = (ids.clone(), refuse.clone());
         move |from: usize, to: usize| {
             let mut order = ids();
-            if !refuse.get() {
+            if refuse.get() {
+                order.swap(0, 1);
+            } else {
                 let id = order.remove(from);
                 order.insert(to, id);
-            } else {
-                order.swap(0, 1);
             }
             for (rank, id) in order.iter().enumerate() {
                 store.elem(*id).rank().write(rank as u32);

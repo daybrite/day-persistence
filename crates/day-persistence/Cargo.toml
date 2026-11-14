@@ -63,3 +63,6 @@ rusqlite = { workspace = true, optional = true, features = ["functions"] }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 day-sqlite-worker = { workspace = true, optional = true }
+
+[lints]
+workspace = true

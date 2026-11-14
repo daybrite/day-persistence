@@ -176,7 +176,7 @@ impl Scene {
                 self.finish(result);
             }
             Err(model::ImportError::Ids) => {
-                self.status.set(res::str::invalid_import_ids().format())
+                self.status.set(res::str::invalid_import_ids().format());
             }
             Err(model::ImportError::Json(error)) => self
                 .status
@@ -257,7 +257,7 @@ impl Scene {
 /// How many pictures a seed stores.
 const GALLERY_SIZE: usize = 120;
 
-/// Compose one window's connection and controls: https://daybrite.dev/docs/navigation/.
+/// Compose one window's connection and controls: <https://daybrite.dev/docs/navigation/>.
 pub fn root() -> AnyPiece {
     let scene = match Scene::new() {
         Ok(scene) => scene,
@@ -328,6 +328,10 @@ fn page<P: Piece>(s: Scene, controls: fn(Scene) -> P) -> impl Piece {
 
 /// The SQL log as a console: each statement the engine runs appends a line, and the view
 /// follows the newest one.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn console(s: Scene) -> impl Piece {
     let trace = s.trace;
     let follow = Signal::new(None);
@@ -372,6 +376,10 @@ fn console(s: Scene) -> impl Piece {
     .grow(Dimension::Both)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn database_page(s: Scene) -> impl Piece {
     let memory = s.clone();
     let durable = s.clone();
@@ -442,6 +450,10 @@ fn database_page(s: Scene) -> impl Piece {
     .spacing(12.0)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn records_page(s: Scene) -> impl Piece {
     let save = s.clone();
     let delete = s.clone();
@@ -491,6 +503,10 @@ fn records_page(s: Scene) -> impl Piece {
     .spacing(10.0)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn sql_page(s: Scene) -> impl Piece {
     let query = s.clone();
     let execute = s.clone();
@@ -526,6 +542,10 @@ fn sql_page(s: Scene) -> impl Piece {
     .spacing(12.0)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn exchange_page(s: Scene) -> impl Piece {
     let export = s.clone();
     let import = s.clone();
@@ -553,6 +573,10 @@ fn exchange_page(s: Scene) -> impl Piece {
 
 /// Eager against lazy, side by side: the same pictures in two tables, one list at a time,
 /// with the counters that tell them apart.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn gallery_page(s: Scene) -> impl Piece {
     s.refresh_gallery_count();
     let seed = s.clone();
@@ -606,10 +630,12 @@ fn gallery_page(s: Scene) -> impl Piece {
                 let db = stats.borrow();
                 format!(
                     "{} / {}",
-                    db.container.cache::<Photo>().with_untracked(|k| k.len()),
+                    db.container
+                        .cache::<Photo>()
+                        .with_untracked(day::model::Keyed::len),
                     db.container
                         .cache::<LazyPhoto>()
-                        .with_untracked(|k| k.len())
+                        .with_untracked(day::model::Keyed::len)
                 )
             })
             .id(day::id!(gallery_resident))
@@ -647,6 +673,10 @@ fn gallery_page(s: Scene) -> impl Piece {
 
 /// The lazy table: a row fault reads the title and size, and the picture's bytes come from
 /// the blob column when the row is shown, through the memo once seen.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn lazy_gallery(db: Rc<RefCell<Database>>) -> impl Piece {
     let query = db
         .borrow()
@@ -678,6 +708,10 @@ fn lazy_gallery(db: Rc<RefCell<Database>>) -> impl Piece {
 }
 
 /// The eager table: every faulted row carries its picture, so scrolling costs the bytes.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a page builder takes its own handle, which each call site clones for it"
+)]
 fn eager_gallery(db: Rc<RefCell<Database>>) -> impl Piece {
     let query = db
         .borrow()

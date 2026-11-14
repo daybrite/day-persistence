@@ -274,7 +274,7 @@ impl<M: ?Sized> std::fmt::Debug for Many<M> {
 }
 
 /// What deleting a referenced parent does. Declared per relation
-/// (`#[model(relation(delete = "…"))]`); the default is `Nullify` (also SwiftData's default
+/// (`#[model(relation(delete = "…"))]`); the default is `Nullify` (also `SwiftData`'s default
 /// for `@Relationship`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeleteRule {
@@ -698,7 +698,7 @@ fn fk_of<P: Model, C: Model>(c: &C, inverse: &str) -> Option<u64> {
         return one.handle_opt();
     }
     if let Some(opt) = any.downcast_ref::<Option<One<P>>>() {
-        return opt.and_then(|o| o.handle_opt());
+        return opt.and_then(One::handle_opt);
     }
     None
 }
@@ -748,20 +748,19 @@ pub fn wire_to_many<P: Model, C: Model>(
     }
     let mut ord_col = None;
     if let Some(ord) = ordered {
-        match C::COLUMNS
+        if let Some(c) = C::COLUMNS
             .iter()
             .find(|c| c.field == ord && c.sql == SqlType::Real)
         {
-            Some(c) => ord_col = Some(c.name),
-            None => {
-                reg.fail(format!(
-                    "relation `{}.{field}` is ordered by `{ord}`, which is not a REAL (`f64`) \
-                     field of `{}` — the order column is a real, visible field of the child",
-                    P::TABLE,
-                    C::TABLE
-                ));
-                return;
-            }
+            ord_col = Some(c.name);
+        } else {
+            reg.fail(format!(
+                "relation `{}.{field}` is ordered by `{ord}`, which is not a REAL (`f64`) \
+                 field of `{}` — the order column is a real, visible field of the child",
+                P::TABLE,
+                C::TABLE
+            ));
+            return;
         }
     }
 
@@ -1145,7 +1144,7 @@ impl JoinRel {
 
     pub(crate) fn side_deleted(&self, is_a: bool, key: u64) {
         let engine = self
-            .with_container(|c| c.engine_cascade_allowed())
+            .with_container(super::ModelContainer::engine_cascade_allowed)
             .unwrap_or(false);
         let rule = if is_a {
             self.a_delete
@@ -1215,7 +1214,7 @@ impl JoinRel {
                 parent,
                 child,
                 position,
-            })
+            });
         });
         true
     }
@@ -1777,7 +1776,7 @@ impl ModelContainer {
                     Op::Insert if change.components.len() == 2 => rel.row_added(key),
                     Op::Delete if change.components.len() == 2 => rel.row_removed(key),
                     Op::Set if change.components.len() >= 3 && change.label == "position" => {
-                        rel.row_moved(key)
+                        rel.row_moved(key);
                     }
                     _ => {}
                 }
@@ -1837,6 +1836,10 @@ impl ModelContainer {
     /// `DeleteRule::Deny` relation is refused with the relation named. Cascade and nullify
     /// need no checked door (a plain `restructure` delete triggers them), but deny cannot
     /// refuse after the row is gone, so this is deny's contract.
+    ///
+    /// # Errors
+    /// Returns a `Deny` error naming the relation when a deny rule still references the row, or the
+    /// storage error when the check cannot read the file.
     pub fn delete<M: Model>(&self, id: impl Into<ModelId<M>>) -> Result<(), DbError> {
         let h = id.into().handle();
         let store = self.cache::<M>();
@@ -1943,6 +1946,10 @@ impl ModelContainer {
 
     /// Give a join store the same table hooks every model store has, so one fold, one
     /// external merge and one undo history cover memberships too.
+    #[expect(
+        clippy::float_cmp,
+        reason = "an unchanged check: the old and the new position are compared exactly, as stored"
+    )]
     pub(crate) fn register_join_hooks(
         &self,
         table: &'static str,
@@ -2015,8 +2022,8 @@ impl ModelContainer {
                         .collect()
                 })
             }),
-            resident_keys: Rc::new(move || store.with_untracked(|k| k.keys())),
-            resident_len: Rc::new(move || store.with_untracked(|k| k.len())),
+            resident_keys: Rc::new(move || store.with_untracked(day_model::Keyed::keys)),
+            resident_len: Rc::new(move || store.with_untracked(day_model::Keyed::len)),
             is_resident: Rc::new(move |h| store.with_untracked(|k| k.get(h).is_some())),
             absorb: Rc::new(move |raw| {
                 let mut rows = Vec::with_capacity(raw.len());
@@ -2037,7 +2044,7 @@ impl ModelContainer {
                 for r in &raw {
                     fresh.push(decode(r)?);
                 }
-                let existing: Vec<u64> = store.with_untracked(|k| k.keys());
+                let existing: Vec<u64> = store.with_untracked(day_model::Keyed::keys);
                 let arriving: std::collections::HashSet<u64> =
                     fresh.iter().map(day_model::Identified::handle).collect();
                 let mut changed = false;

@@ -91,12 +91,11 @@ fn main() {
     // for the wasm driver, and a wasm build from a Windows host targets clang, not cl. Fail with
     // the reason rather than letting cl.exe error on the first flag it does not know
     // (scripts/ci/host-test.sh excludes this crate on Windows hosts for the same reason).
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        panic!(
-            "day-sqlite-worker's native engine build supports gcc/clang hosts only \
-             (wasm32 is the product form); exclude this crate when testing on MSVC targets"
-        );
-    }
+    assert!(
+        std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc"),
+        "day-sqlite-worker's native engine build supports gcc/clang hosts only \
+         (wasm32 is the product form); exclude this crate when testing on MSVC targets"
+    );
 
     let mut cc = cc::Build::new();
     cc.warnings(false)

@@ -14,6 +14,7 @@
 //! can animate the difference instead of reloading.
 
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 
 use crate::{Value, ident};
 
@@ -112,6 +113,10 @@ pub enum Pred {
 impl Pred {
     /// The columns whose change can move a result through this predicate: local columns
     /// only; what a predicate reads across a relation is collected by [`Pred::related_deps`].
+    #[expect(
+        clippy::match_same_arms,
+        reason = "each empty arm carries the explanation of why that predicate reads no local column"
+    )]
     pub fn columns(&self, out: &mut Vec<&'static str>) {
         let push = |c: &'static str, out: &mut Vec<&'static str>| {
             if !out.contains(&c) {
@@ -236,6 +241,10 @@ impl Pred {
     /// A comparison against a NULL column is unknown (`None`), not false: SQL's `notes <> 'x'`
     /// does not select rows whose `notes` is NULL, and neither does this. `Eq`/`Ne` against a
     /// `Null` literal keep their `IS NULL` / `IS NOT NULL` meaning and are always definite.
+    #[expect(
+        clippy::match_same_arms,
+        reason = "each constant arm carries the explanation of why that predicate is not evaluated here"
+    )]
     pub fn eval3(&self, key: u64, row: &dyn RowView) -> Option<bool> {
         match self {
             Pred::Always => Some(true),
@@ -386,7 +395,7 @@ pub(crate) trait SqlIndex {
     fn table_sql(&self, table: &str) -> String;
     /// The FTS5 shadow table of `table`, when the model declares `fts(…)`.
     fn fts_of(&self, table: &str) -> Option<FtsSql>;
-    fn fts_key_of(&self, _table: &str) -> &str {
+    fn fts_key_of(&self, _table: &str) -> &'static str {
         "rowid"
     }
     /// The R*Tree shadow of `table`, quoted, when `lat`/`lon` are its declared `spatial(…)`
@@ -493,7 +502,7 @@ pub(crate) fn compile_fetch(
 
     let mut sql = format!("SELECT {t}.{key} FROM {from}");
     if where_clause != "1" {
-        sql.push_str(&format!(" WHERE {where_clause}"));
+        let _ = write!(sql, " WHERE {where_clause}");
     }
     let mut orders: Vec<String> = Vec::new();
     for s in &fetch.sort {
@@ -510,9 +519,9 @@ pub(crate) fn compile_fetch(
     // The key tie-break makes the order total and deterministic, so the same fetch always
     // answers in the same order and a diff against the previous answer is meaningful.
     orders.push(format!("{t}.{key} ASC"));
-    sql.push_str(&format!(" ORDER BY {}", orders.join(", ")));
+    let _ = write!(sql, " ORDER BY {}", orders.join(", "));
     if let Some(n) = fetch.limit {
-        sql.push_str(&format!(" LIMIT {n}"));
+        let _ = write!(sql, " LIMIT {n}");
     }
     Ok(SqlQuery { sql, params })
 }
@@ -544,7 +553,7 @@ pub(crate) fn compile_count(
     )?;
     let mut sql = format!("SELECT COUNT(*) FROM {t}");
     if where_clause != "1" {
-        sql.push_str(&format!(" WHERE {where_clause}"));
+        let _ = write!(sql, " WHERE {where_clause}");
     }
     Ok(SqlQuery { sql, params })
 }
@@ -612,7 +621,7 @@ pub(crate) fn compile_fallback(
     let mut sql = format!("SELECT {cols} FROM {t}");
     let clauses: Vec<String> = clauses.into_iter().filter(|c| c != "1").collect();
     if !clauses.is_empty() {
-        sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
+        let _ = write!(sql, " WHERE {}", clauses.join(" AND "));
     }
     let mut orders: Vec<String> = fetch
         .sort
@@ -627,7 +636,7 @@ pub(crate) fn compile_fallback(
         })
         .collect();
     orders.push(format!("{t}.{key} ASC"));
-    sql.push_str(&format!(" ORDER BY {}", orders.join(", ")));
+    let _ = write!(sql, " ORDER BY {}", orders.join(", "));
     Ok((SqlQuery { sql, params }, deps))
 }
 
@@ -1299,6 +1308,7 @@ impl Fetch {
     pub fn new() -> Fetch {
         Fetch::default()
     }
+    #[must_use]
     pub fn filter(mut self, p: Pred) -> Fetch {
         self.pred = match self.pred {
             Pred::Always => p,
@@ -1306,10 +1316,12 @@ impl Fetch {
         };
         self
     }
+    #[must_use]
     pub fn sort(mut self, s: Sort) -> Fetch {
         self.sort.push(s);
         self
     }
+    #[must_use]
     pub fn limit(mut self, n: usize) -> Fetch {
         self.limit = Some(n);
         self

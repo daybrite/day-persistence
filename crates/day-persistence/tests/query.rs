@@ -32,7 +32,7 @@ fn trips(n: u32) -> Vec<Trip> {
         .map(|i| Trip {
             id: i,
             name: format!("trip {i:03}"),
-            start_day: i as i64,
+            start_day: i64::from(i),
             done: i % 4 == 0,
             notes: String::new(),
             rating: None,
@@ -76,7 +76,7 @@ fn the_builder_filters_sorts_and_limits() {
         "not-done, start descending, first three"
     );
     assert_eq!(q.count(), 3);
-    assert_eq!(q.first().map(|i| i.handle()), Some(10));
+    assert_eq!(q.first().map(day_model::ModelId::handle), Some(10));
 }
 
 #[test]

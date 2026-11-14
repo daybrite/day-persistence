@@ -1,8 +1,8 @@
 // Copyright © The Daybrite Project
 // SPDX-License-Identifier: MPL-2.0
 
-//! The SQLCipher build (`--features cipher`): encrypted at rest, wrong keys refused at open,
-//! and the encrypt_to → open → decrypt_to lifecycle round-trips. Compiles empty otherwise.
+//! The `SQLCipher` build (`--features cipher`): encrypted at rest, wrong keys refused at open,
+//! and the `encrypt_to` → open → `decrypt_to` lifecycle round-trips. Compiles empty otherwise.
 
 #![cfg(feature = "cipher")]
 

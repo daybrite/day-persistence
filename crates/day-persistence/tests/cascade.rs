@@ -89,7 +89,7 @@ struct Node {
 type Trace = Rc<RefCell<Vec<String>>>;
 
 fn traced(driver: Sqlite) -> (Sqlite, Trace) {
-    let trace: Trace = Default::default();
+    let trace: Trace = Rc::default();
     let sink = trace.clone();
     (
         driver.trace_sql(move |sql| sink.borrow_mut().push(sql.to_string())),
@@ -280,7 +280,7 @@ fn a_deep_self_referential_chain_goes_in_one_statement() {
     );
     assert!(sql.len() < 12, "{sql:?}");
     assert_eq!(c.table_count::<Node>().expect("count"), 0);
-    assert_eq!(c.cache::<Node>().with_untracked(|k| k.len()), 0);
+    assert_eq!(c.cache::<Node>().with_untracked(day_model::Keyed::len), 0);
 }
 
 #[test]
@@ -550,7 +550,7 @@ fn with_a_participant_installed_the_change_set_lists_every_cascaded_row() {
 
     let c = ModelContainer::open(Sqlite::memory(), tracker_schema()).expect("open");
     seed(&c, 4);
-    let seen: Rc<RefCell<Vec<(String, RowChangeKind)>>> = Default::default();
+    let seen: Rc<RefCell<Vec<(String, RowChangeKind)>>> = Rc::default();
     c.install_transaction_participant(Journal(seen.clone()))
         .expect("participant");
     c.get::<Person>(1u32)

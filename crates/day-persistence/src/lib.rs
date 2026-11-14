@@ -35,7 +35,7 @@
 //!
 //! The driver is a trait so the engine is the app's choice: the built-in [`Sqlite`] driver
 //! (feature `driver-rusqlite`, on by default) compiles a bundled SQLite, links the system one
-//! (`system`), or builds SQLCipher (`cipher`); the [`Recorder`] answers from fixtures and
+//! (`system`), or builds `SQLCipher` (`cipher`); the [`Recorder`] answers from fixtures and
 //! records every statement, which is what keeps persistence assertable headlessly: a test
 //! can check the SQL a UI action produced without a database on disk.
 //!
@@ -48,6 +48,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -183,6 +184,10 @@ pub enum Value {
 }
 
 impl Value {
+    /// The integer this value holds.
+    ///
+    /// # Errors
+    /// Returns a decoding error when the value is not an `INTEGER`.
     pub fn as_int(&self) -> Result<i64, DbError> {
         match self {
             Value::Int(i) => Ok(*i),
@@ -192,6 +197,10 @@ impl Value {
             )),
         }
     }
+    /// The floating-point number this value holds.
+    ///
+    /// # Errors
+    /// Returns a decoding error when the value is not a `REAL`.
     pub fn as_real(&self) -> Result<f64, DbError> {
         match self {
             Value::Real(r) => Ok(*r),
@@ -202,6 +211,10 @@ impl Value {
             )),
         }
     }
+    /// The text this value holds.
+    ///
+    /// # Errors
+    /// Returns a decoding error when the value is not `TEXT`.
     pub fn as_text(&self) -> Result<&str, DbError> {
         match self {
             Value::Text(t) => Ok(t),
@@ -211,6 +224,10 @@ impl Value {
             )),
         }
     }
+    /// The bytes this value holds.
+    ///
+    /// # Errors
+    /// Returns a decoding error when the value is not a `BLOB`.
     pub fn as_blob(&self) -> Result<&[u8], DbError> {
         match self {
             Value::Blob(b) => Ok(b),
@@ -309,14 +326,14 @@ impl Drop for Secret {
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     pub location: Location,
-    /// SQLCipher key; drivers without encryption reject it loudly.
+    /// `SQLCipher` key; drivers without encryption reject it loudly.
     pub key: Option<Secret>,
     /// Journal in WAL mode (files only; ignored in memory). Default true.
     pub wal: bool,
     /// Enforce foreign keys. Default true.
     pub foreign_keys: bool,
     pub busy_timeout_ms: u32,
-    /// Upgrade a file written by an older SQLCipher generation (PRAGMA cipher_migrate).
+    /// Upgrade a file written by an older `SQLCipher` generation (PRAGMA `cipher_migrate`).
     pub cipher_migrate: bool,
 }
 
@@ -412,6 +429,10 @@ impl fmt::Display for ForeignKeyViolation {
 /// `Box<dyn SqliteConnection>` and never names an engine type.
 pub trait SqliteDriver {
     type Connection: SqliteConnection;
+    /// Open the connection.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the database cannot be opened.
     fn open(self) -> Result<Self::Connection, DbError>;
     fn capabilities(&self) -> Capabilities;
 }
@@ -443,31 +464,58 @@ impl SqliteConnection for Box<dyn SqliteConnection> {
 
 /// One open connection. Everything above speaks plain SQL and [`Value`]s through it.
 pub trait SqliteConnection: 'static {
+    /// Run one statement and return the number of rows it changed.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails.
     fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64, DbError>;
+    /// Run one statement, handing each result row to `row`.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails.
     fn query(
         &mut self,
         sql: &str,
         params: &[Value],
         row: &mut dyn FnMut(&dyn Row),
     ) -> Result<(), DbError>;
+    /// Begin a transaction.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails.
     fn begin(&mut self) -> Result<(), DbError> {
         self.execute("BEGIN", &[]).map(|_| ())
     }
+    /// Commit the open transaction.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails.
     fn commit(&mut self) -> Result<(), DbError> {
         self.execute("COMMIT", &[]).map(|_| ())
     }
+    /// Roll the open transaction back.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails.
     fn rollback(&mut self) -> Result<(), DbError> {
         self.execute("ROLLBACK", &[]).map(|_| ())
     }
     /// Several statements in one string, no parameters: a DDL script, a migration step
     /// (day-lite's storage speaks this). The default runs the string as one statement;
     /// drivers whose engine executes scripts override it (the built-in native driver does).
+    ///
+    /// # Errors
+    /// Returns the engine's error of the first statement that fails.
     fn execute_batch(&mut self, sql: &str) -> Result<(), DbError> {
         self.execute(sql, &[]).map(|_| ())
     }
     /// [`SqliteConnection::query`], with the result's column names alongside each row, for
     /// callers that surface rows as named objects (day-lite's JS bridge). A driver that
     /// cannot name columns refuses rather than guessing.
+    ///
+    /// # Errors
+    /// Returns the engine's error when the statement fails, or an error from a driver that cannot
+    /// name columns.
     fn query_named(
         &mut self,
         sql: &str,
@@ -544,6 +592,7 @@ impl Recorder {
     }
 
     /// Rows a table's `SELECT` will answer with.
+    #[must_use]
     pub fn with_table(self, table: &str, rows: Vec<Vec<Value>>) -> Self {
         self.state.fixtures.borrow_mut().insert(table.into(), rows);
         self
@@ -617,6 +666,10 @@ pub trait ColumnValue: Sized + 'static {
     /// migration, never a surprise.
     const SQL_TYPE: SqlType;
     fn to_sqlite_value(&self) -> Value;
+    /// Decode the stored value.
+    ///
+    /// # Errors
+    /// Returns a decoding error when `v` is not a value this type stores.
     fn from_sqlite_value(v: Value) -> Result<Self, DbError>;
 }
 
@@ -625,6 +678,10 @@ pub trait ColumnValue: Sized + 'static {
 pub trait ValueCodec<T>: 'static {
     const SQL_TYPE: SqlType;
     fn to_sqlite_value(v: &T) -> Value;
+    /// Decode the stored value.
+    ///
+    /// # Errors
+    /// Returns a decoding error when `v` is not a value this codec stores.
     fn from_sqlite_value(v: Value) -> Result<T, DbError>;
 }
 
@@ -632,6 +689,10 @@ macro_rules! int_column {
     ($($t:ty),*) => {$(
         impl ColumnValue for $t {
             const SQL_TYPE: SqlType = SqlType::Integer;
+            #[allow(
+                clippy::cast_lossless,
+                reason = "one macro body serves every integer width, and `From` exists for only some of them"
+            )]
             fn to_sqlite_value(&self) -> Value {
                 Value::Int(*self as i64)
             }
@@ -646,7 +707,7 @@ int_column!(i8, i16, i32, i64, u8, u16, u32, u64, usize, isize);
 impl ColumnValue for bool {
     const SQL_TYPE: SqlType = SqlType::Integer;
     fn to_sqlite_value(&self) -> Value {
-        Value::Int(*self as i64)
+        Value::Int(i64::from(*self))
     }
     fn from_sqlite_value(v: Value) -> Result<Self, DbError> {
         Ok(v.as_int()? != 0)
@@ -666,7 +727,7 @@ impl ColumnValue for f64 {
 impl ColumnValue for f32 {
     const SQL_TYPE: SqlType = SqlType::Real;
     fn to_sqlite_value(&self) -> Value {
-        Value::Real(*self as f64)
+        Value::Real(f64::from(*self))
     }
     fn from_sqlite_value(v: Value) -> Result<Self, DbError> {
         Ok(v.as_real()? as f32)
@@ -901,6 +962,10 @@ pub trait Model: Identified + day_model::ApplyField + Clone + 'static {
     const SCHEMA: Option<&'static str> = None;
     /// One [`Value`] per column, in `COLUMNS` order.
     fn to_row(&self) -> Vec<Value>;
+    /// Decode one row, its columns in `COLUMNS` order.
+    ///
+    /// # Errors
+    /// Returns a decoding error when a column holds a value its field cannot take.
     fn from_row(row: &dyn Row) -> Result<Self, DbError>;
     /// Each column's Rust-default value: what an added column backfills with.
     fn default_row() -> Vec<Value>;
@@ -981,7 +1046,7 @@ pub fn model_fingerprint<M: Model>() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for b in bytes {
-            h ^= *b as u64;
+            h ^= u64::from(*b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     };
@@ -995,7 +1060,11 @@ pub fn model_fingerprint<M: Model>() -> u64 {
     for c in M::COLUMNS {
         eat(c.name.as_bytes());
         eat(c.sql.ddl().as_bytes());
-        eat(&[c.not_null as u8, c.unique as u8, c.indexed as u8]);
+        eat(&[
+            u8::from(c.not_null),
+            u8::from(c.unique),
+            u8::from(c.indexed),
+        ]);
     }
     for idx in M::COMPOSITE_INDEXES {
         for c in *idx {
@@ -1081,6 +1150,7 @@ impl Schema {
     pub fn new() -> Self {
         Self::default()
     }
+    #[must_use]
     pub fn with<M: Model>(mut self) -> Self {
         for def in M::RELATIONS {
             if def.join.is_none() {
@@ -1095,7 +1165,7 @@ impl Schema {
                 });
             }
         }
-        self.installers.push(Box::new(|c| c.attach::<M>()));
+        self.installers.push(Box::new(ModelContainer::attach::<M>));
         self.wirers.push(Box::new(|c| {
             let mut reg = Registrar {
                 container: c,
@@ -1144,6 +1214,7 @@ impl MigrationPlan {
     }
     /// A hand-written stage taking the database from `from` to `to`. Stages run in ascending
     /// order from the file's current version; a gap is an error at open.
+    #[must_use]
     pub fn custom(
         mut self,
         from: u32,
@@ -1276,13 +1347,12 @@ impl DirtyState {
         match (change.op, &mut *slot) {
             (Op::Delete, _) => *slot = DirtyRow::Delete,
             (Op::Insert, _) => *slot = DirtyRow::Insert,
-            (Op::Set, DirtyRow::Insert) | (Op::Set, DirtyRow::Delete) => {}
+            (Op::Set, DirtyRow::Insert | DirtyRow::Delete) | (Op::Move, _) => {}
             (Op::Set, DirtyRow::Update(columns)) => {
                 if change.components.len() >= 3 && !columns.contains(&change.label) {
                     columns.push(change.label);
                 }
             }
-            (Op::Move, _) => {}
         }
     }
 }
@@ -1346,7 +1416,7 @@ pub(crate) struct TableHooks {
     pub(crate) watch_undo: Rc<dyn Fn(&day_model::UndoStack)>,
 }
 
-/// Why a durable transaction is being performed. Cache refreshes use EXTERNAL_AUTHOR and
+/// Why a durable transaction is being performed. Cache refreshes use `EXTERNAL_AUTHOR` and
 /// do not constitute a write transaction. Remote imports persist but must not echo outbound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WriteOrigin {
@@ -1440,6 +1510,10 @@ pub enum Refresh {
 /// transaction. `before_commit` runs after worker reactions and intermediate saves settle.
 /// Persist extension state transactionally; callbacks may run again following a rollback.
 pub trait TransactionParticipant: 'static {
+    /// Runs when a transaction opens, on its connection.
+    ///
+    /// # Errors
+    /// An error aborts the transaction.
     fn begin(
         &self,
         connection: &mut dyn SqliteConnection,
@@ -1450,6 +1524,9 @@ pub trait TransactionParticipant: 'static {
     /// rollback. The answer names the cache refresh to run after a successful COMMIT, before
     /// the work is acknowledged; a refresh failure surfaces as
     /// [`DbErrorKind::CommittedRefreshFailed`] (the data is durable, it cannot roll back).
+    ///
+    /// # Errors
+    /// An error aborts the transaction.
     fn before_commit(
         &self,
         connection: &mut dyn SqliteConnection,
@@ -1463,7 +1540,7 @@ pub(crate) struct ContainerInner {
     caps: Capabilities,
     /// store root id → hooks.
     tables: RefCell<HashMap<u64, TableHooks>>,
-    /// model TypeId → the `Store<Keyed<M>>` handle, boxed.
+    /// model `TypeId` → the `Store<Keyed<M>>` handle, boxed.
     stores: RefCell<HashMap<TypeId, Box<dyn Any>>>,
     dirty: RefCell<DirtyState>,
     /// Live query result sets, marked stale from the change sink. Weak: the app's `Query`
@@ -1534,6 +1611,10 @@ impl ModelContainer {
     /// Open through `driver`, migrate, and attach every model in `schema`. Attaching creates
     /// or migrates the table and nothing more: no rows load, so open cost does not grow with
     /// the file. Autosave is on: any turn that touched a store flushes at its end.
+    ///
+    /// # Errors
+    /// Returns an error when the driver cannot open the database, or when a table cannot be created
+    /// or migrated to the declared schema.
     pub fn open<D: SqliteDriver>(driver: D, schema: Schema) -> Result<ModelContainer, DbError>
     where
         D::Connection: 'static,
@@ -1542,6 +1623,10 @@ impl ModelContainer {
     }
 
     /// [`ModelContainer::open`], with hand-written migration stages that run first.
+    ///
+    /// # Errors
+    /// Returns an error when the driver cannot open the database, a migration stage fails, or a
+    /// table cannot be created or migrated to the declared schema.
     pub fn open_with<D: SqliteDriver>(
         driver: D,
         schema: Schema,
@@ -1622,8 +1707,11 @@ impl ModelContainer {
     /// The working-set cache for `M`, an ordinary day-model store holding the rows currently
     /// resident and not the table: its `keys()` are whatever happens to be faulted in. Bindings
     /// and accessors work on it unchanged; enumerate rows through a [`ModelContainer::query`],
-    /// never through the cache. Panics only if `M` was not in the container's `schema!`,
-    /// which is a wiring bug worth stopping on.
+    /// never through the cache.
+    ///
+    /// # Panics
+    /// Panics only if `M` was not in the container's `schema!`, which is a wiring bug worth
+    /// stopping on.
     pub fn cache<M: Model>(&self) -> Store<Keyed<M>> {
         let stores = self.inner.stores.borrow();
         let any = stores
@@ -1812,7 +1900,7 @@ impl ModelContainer {
         let mut bytes = Vec::new();
         self.conn()
             .query(&format!("SELECT {tail}"), &params, &mut |row| {
-                bytes = row.get(0).as_blob().map(|b| b.to_vec()).unwrap_or_default();
+                bytes = row.get(0).as_blob().map(<[u8]>::to_vec).unwrap_or_default();
             })?;
         let bytes = std::sync::Arc::new(bytes);
         let limit = self.inner.blob_cache_limit.get();
@@ -1900,7 +1988,7 @@ impl ModelContainer {
                 ident(column)
             ),
             &all,
-            &mut |row| bytes = row.get(0).as_blob().map(|b| b.to_vec()).unwrap_or_default(),
+            &mut |row| bytes = row.get(0).as_blob().map(<[u8]>::to_vec).unwrap_or_default(),
         )?;
         Ok(bytes)
     }
@@ -1922,6 +2010,10 @@ impl ModelContainer {
     /// Install one transaction extension before exposing the container to writers. Registration
     /// does not initialize its schema; do that in the worker factory first. No replacement or
     /// removal is supported, preventing a sync-enabled connection silently losing journaling.
+    ///
+    /// # Errors
+    /// Returns a `Deny` error when the container has pending changes, is inside a worker
+    /// transaction, or already has a participant.
     pub fn install_transaction_participant(
         &self,
         participant: impl TransactionParticipant,
@@ -2000,6 +2092,9 @@ impl ModelContainer {
 
     /// Flush every pending change now, in one transaction. Autosave calls this at turn end;
     /// call it directly where the error matters at a known point.
+    ///
+    /// # Errors
+    /// Returns the storage error when the flush fails.
     pub fn save(&self) -> Result<(), DbError> {
         self.save_now().map(|_| ())
     }
@@ -2007,6 +2102,9 @@ impl ModelContainer {
     /// Run `f` and return the SQL one flush of everything it changed issues: the headless
     /// persistence assert (autosave is suspended for the duration so the statements land
     /// here). Twenty keystrokes into one field come back as one `UPDATE`.
+    ///
+    /// # Errors
+    /// Returns the storage error when the flush fails.
     pub fn record_sql(&self, f: impl FnOnce()) -> Result<Vec<String>, DbError> {
         let prior = self.inner.autosave.replace(false);
         f();
@@ -2139,6 +2237,9 @@ impl ModelContainer {
     }
 
     /// Read a row, distinguishing an absent key from a storage or decoding failure.
+    ///
+    /// # Errors
+    /// Returns the storage or decoding error when the row cannot be read.
     pub fn try_get<M: Model>(
         &self,
         id: impl Into<ModelId<M>>,
@@ -2156,12 +2257,18 @@ impl ModelContainer {
     /// Make these rows resident, faulting the missing ones in one chunked `SELECT`. Rows the
     /// file does not have are not resident afterwards; rows deleted this turn are not
     /// resurrected.
+    ///
+    /// # Errors
+    /// Returns the storage or decoding error when the rows cannot be read.
     pub fn ensure_resident<M: Model>(&self, keys: &[u64]) -> Result<(), DbError> {
         let store = self.cache::<M>();
         self.fault_into(store.store_id(), keys)
     }
 
     /// [`ModelContainer::ensure_resident`], typed ids in.
+    ///
+    /// # Errors
+    /// Returns the storage or decoding error when the rows cannot be read.
     pub fn ensure<M: Model>(
         &self,
         ids: impl IntoIterator<Item = impl Into<ModelId<M>>>,
@@ -2175,6 +2282,9 @@ impl ModelContainer {
     /// it once at open. Raise the cache limit first (`set_cache_limit(usize::MAX)` for a
     /// document container) so the warmed rows are not immediately eligible to leave; rows
     /// deleted this turn stay deleted. Returns how many rows are resident afterward.
+    ///
+    /// # Errors
+    /// Returns the storage or decoding error when the rows cannot be read.
     pub fn warm<M: Model>(&self) -> Result<usize, DbError> {
         let store = self.cache::<M>();
         let key = ident(M::KEY);
@@ -2183,7 +2293,7 @@ impl ModelContainer {
             TableName::of::<M>().sql()
         ))?;
         self.fault_into(store.store_id(), &keys)?;
-        Ok(store.with_untracked(|k| k.len()))
+        Ok(store.with_untracked(day_model::Keyed::len))
     }
 
     /// Insert one row through the front door: it becomes resident and dirty, announces, and
@@ -2196,6 +2306,9 @@ impl ModelContainer {
 
     /// `SELECT COUNT(*)`: the table's true size, which the cache cannot know. Settles
     /// pending writes first (with autosave), like every other read.
+    ///
+    /// # Errors
+    /// Returns the storage error when the read fails.
     pub fn table_count<M: Model>(&self) -> Result<u64, DbError> {
         if self.inner.autosave.get() && !self.inner.dirty.borrow().is_empty() {
             self.save()?;
@@ -2451,7 +2564,7 @@ impl ModelContainer {
         conn.execute(
             "INSERT INTO _day_schema (table_name, fingerprint, version) VALUES ('_db', '', ?) \
              ON CONFLICT(table_name) DO UPDATE SET version = excluded.version",
-            &[Value::Int(v as i64)],
+            &[Value::Int(i64::from(v))],
         )?;
         Ok(())
     }
@@ -2521,8 +2634,7 @@ impl ModelContainer {
         let key_sql = M::COLUMNS
             .iter()
             .find(|c| c.name == M::KEY)
-            .map(|c| c.sql)
-            .unwrap_or(SqlType::Integer);
+            .map_or(SqlType::Integer, |c| c.sql);
         if key_sql != SqlType::Integer && M::SPATIAL.is_some() {
             return Err(DbError::new(
                 DbErrorKind::Unsupported,
@@ -2538,7 +2650,7 @@ impl ModelContainer {
         // so the next fault reads the new file.
         if self.inner.stores.borrow().contains_key(&TypeId::of::<M>()) {
             let store = self.cache::<M>();
-            let keys: Vec<u64> = store.with_untracked(|k| k.keys());
+            let keys: Vec<u64> = store.with_untracked(day_model::Keyed::keys);
             store.depopulate_many(&keys);
             return Ok(());
         }
@@ -2561,7 +2673,7 @@ impl ModelContainer {
         let columns: Vec<String> = M::COLUMNS.iter().map(|c| c.name.to_string()).collect();
         let fields: Vec<String> = M::COLUMNS.iter().map(|c| c.field.to_string()).collect();
         let row_for = {
-            Rc::new(move |key: u64| store.with_untracked(|k| k.get(key).map(|m| m.to_row())))
+            Rc::new(move |key: u64| store.with_untracked(|k| k.get(key).map(Model::to_row)))
                 as Rc<dyn Fn(u64) -> Option<Vec<Value>>>
         };
         let all_rows = {
@@ -2571,10 +2683,10 @@ impl ModelContainer {
                 })
             }) as Rc<dyn Fn() -> Vec<(u64, Vec<Value>)>>
         };
-        let resident_keys =
-            Rc::new(move || store.with_untracked(|k| k.keys())) as Rc<dyn Fn() -> Vec<u64>>;
+        let resident_keys = Rc::new(move || store.with_untracked(day_model::Keyed::keys))
+            as Rc<dyn Fn() -> Vec<u64>>;
         let resident_len =
-            Rc::new(move || store.with_untracked(|k| k.len())) as Rc<dyn Fn() -> usize>;
+            Rc::new(move || store.with_untracked(day_model::Keyed::len)) as Rc<dyn Fn() -> usize>;
         let is_resident = Rc::new(move |h: u64| store.with_untracked(|k| k.get(h).is_some()))
             as Rc<dyn Fn(u64) -> bool>;
 
@@ -2585,7 +2697,8 @@ impl ModelContainer {
                     for r in raw_rows {
                         decoded.push(M::from_row(&r)?);
                     }
-                    let keys: Vec<u64> = decoded.iter().map(|m| m.handle()).collect();
+                    let keys: Vec<u64> =
+                        decoded.iter().map(day_model::Identified::handle).collect();
                     store.populate(decoded);
                     Ok(keys)
                 },
@@ -2597,14 +2710,14 @@ impl ModelContainer {
                 for r in raw_rows {
                     fresh.push(M::from_row(&r)?);
                 }
-                let existing: Vec<u64> = store.with_untracked(|k| k.keys());
+                let existing: Vec<u64> = store.with_untracked(day_model::Keyed::keys);
                 let fresh_keys: std::collections::HashSet<u64> =
-                    fresh.iter().map(|m| m.handle()).collect();
+                    fresh.iter().map(day_model::Identified::handle).collect();
                 let mut changed = false;
                 day_model::with_author(ModelContainer::EXTERNAL_AUTHOR, || {
                     for m in fresh {
                         let key = m.handle();
-                        match store.with_untracked(|k| k.get(key).map(|old| old.to_row())) {
+                        match store.with_untracked(|k| k.get(key).map(Model::to_row)) {
                             // Selected by resident keys, so an unknown row means the cache
                             // moved underneath us; treat it as an arrival.
                             None => {
@@ -2734,7 +2847,7 @@ impl ModelContainer {
                 .chain(s.parent_table.bytes())
                 .chain(s.rule.sql().bytes())
             {
-                fp_val ^= b as u64;
+                fp_val ^= u64::from(b);
                 fp_val = fp_val.wrapping_mul(0x1000_0000_01b3);
             }
         }
@@ -2802,9 +2915,9 @@ impl ModelContainer {
                 }
                 let mut unique_indexes: Vec<&'static str> = Vec::new();
                 match delta {
-                    None => self.create_table_named::<M>(name.sql())?,
+                    None => self.create_table_named::<M>(&name.sql())?,
                     Some((SchemaDelta::Lightweight(plan), _)) => {
-                        unique_indexes = plan.unique_indexes.clone();
+                        unique_indexes.clone_from(&plan.unique_indexes);
                         self.lightweight_migrate::<M>(&plan)?;
                     }
                     Some((SchemaDelta::Rebuild, file)) => {
@@ -3114,7 +3227,7 @@ impl ModelContainer {
     /// rebuild copies into). The fresh form carries every constraint inline; the upgrade
     /// paths produce the same enforced constraints by other means (a `NOT NULL DEFAULT`
     /// addition, a `day_uidx_` unique index), and the comparison treats them as equal.
-    fn create_table_named<M: Model>(&self, table_sql: String) -> Result<(), DbError> {
+    fn create_table_named<M: Model>(&self, table_sql: &str) -> Result<(), DbError> {
         let cols: Vec<String> = self
             .declared_columns::<M>()
             .iter()
@@ -3181,7 +3294,7 @@ impl ModelContainer {
             .collect();
         out.extend(M::COMPOSITE_INDEXES.iter().map(|idx| DeclaredIndex {
             name: format!("day_idx_{bare}_{}", idx.join("_")),
-            columns: idx.iter().map(|c| c.to_string()).collect(),
+            columns: idx.iter().map(std::string::ToString::to_string).collect(),
             unique: false,
         }));
         out.extend(unique_indexes.iter().map(|c| DeclaredIndex {
@@ -3191,7 +3304,7 @@ impl ModelContainer {
         }));
         out.extend(M::UNIQUE_INDEXES.iter().map(|idx| DeclaredIndex {
             name: format!("day_uidx_{bare}_{}", idx.join("_")),
-            columns: idx.iter().map(|c| c.to_string()).collect(),
+            columns: idx.iter().map(std::string::ToString::to_string).collect(),
             unique: true,
         }));
         out
@@ -3516,7 +3629,7 @@ impl ModelContainer {
                 c.sql.ddl()
             );
             if c.not_null {
-                ddl.push_str(&format!(" NOT NULL DEFAULT {}", sql_literal(&default)?));
+                let _ = write!(ddl, " NOT NULL DEFAULT {}", sql_literal(&default)?);
             }
             if let Some(fk) = &d.fk {
                 ddl.push_str(&fk.clause());
@@ -3603,7 +3716,7 @@ impl ModelContainer {
         self.conn()
             .execute(&format!("DROP TABLE IF EXISTS {tmp}"), &[])
             .map_err(wrap)?;
-        self.create_table_named::<M>(tmp.clone()).map_err(wrap)?;
+        self.create_table_named::<M>(&tmp).map_err(wrap)?;
         let targets = column_list(&declared.iter().map(|d| d.def.name).collect::<Vec<_>>());
         let mut sources: Vec<String> = Vec::with_capacity(declared.len());
         for d in &declared {
@@ -3717,7 +3830,7 @@ impl ModelContainer {
 
     fn flush(&self, dirty: &DirtyState) -> Result<Vec<(String, Vec<Value>)>, DbError> {
         let capture = self.inner.participant.borrow().is_some();
-        let (stmts, changes) = self.fold(dirty, capture)?;
+        let (stmts, changes) = self.fold(dirty, capture);
         if stmts.is_empty() {
             return Ok(stmts);
         }
@@ -3745,7 +3858,7 @@ impl ModelContainer {
         if !outer
             && let Err(error) = self
                 .participant_commit(conn.as_mut(), WriteOrigin::Local)
-                .and_then(|_| conn.commit())
+                .and_then(|()| conn.commit())
         {
             let _ = conn.rollback();
             self.participant_rollback();
@@ -3890,7 +4003,7 @@ impl ModelContainer {
         &self,
         dirty: &DirtyState,
         capture: bool,
-    ) -> Result<(Vec<(String, Vec<Value>)>, Vec<RowChange>), DbError> {
+    ) -> (Vec<(String, Vec<Value>)>, Vec<RowChange>) {
         let tables = self.inner.tables.borrow();
         let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
         let mut changes: Vec<RowChange> = Vec::new();
@@ -3990,19 +4103,16 @@ impl ModelContainer {
                 DirtyRow::Insert => {
                     if let Some(row) = (hooks.row_for)(key) {
                         capture_as(RowChangeKind::Inserted);
-                        match open_inserts.get(&store_id) {
-                            Some(&i) => {
-                                if let Batch::Inserts { rows, .. } = &mut batches[i] {
-                                    rows.push(row);
-                                }
+                        if let Some(&i) = open_inserts.get(&store_id) {
+                            if let Batch::Inserts { rows, .. } = &mut batches[i] {
+                                rows.push(row);
                             }
-                            None => {
-                                open_inserts.insert(store_id, batches.len());
-                                batches.push(Batch::Inserts {
-                                    store: store_id,
-                                    rows: vec![row],
-                                });
-                            }
+                        } else {
+                            open_inserts.insert(store_id, batches.len());
+                            batches.push(Batch::Inserts {
+                                store: store_id,
+                                rows: vec![row],
+                            });
                         }
                     }
                 }
@@ -4073,7 +4183,7 @@ impl ModelContainer {
                     let Some(hooks) = tables.get(&store) else {
                         continue;
                     };
-                    insert_stmts(hooks, rows, &mut stmts);
+                    insert_stmts(hooks, &rows, &mut stmts);
                 }
                 Batch::Keyed { store, set, keys } => {
                     let Some(hooks) = tables.get(&store) else {
@@ -4083,13 +4193,17 @@ impl ModelContainer {
                 }
             }
         }
-        Ok((stmts, changes))
+        (stmts, changes)
     }
 
     // --- maintenance (docs/persistence.md) ---------------------------------------------------
 
     /// `VACUUM INTO`: a transactionally consistent, already-compacted snapshot, taken while
     /// the app keeps writing. Restore is an open, not a verb.
+    ///
+    /// # Errors
+    /// Returns the storage error when pending changes cannot be saved or the snapshot cannot be
+    /// written.
     pub fn backup_to(&self, path: &Path) -> Result<(), DbError> {
         self.save()?;
         self.conn().execute(
@@ -4103,6 +4217,9 @@ impl ModelContainer {
     /// the database is sound. A foreign-key violation reads
     /// `foreign key: <child> row <rowid> references missing <parent>`; the structured form is
     /// [`ModelContainer::foreign_key_check`].
+    ///
+    /// # Errors
+    /// Returns the storage error when a check cannot run. Findings are not errors.
     pub fn integrity_check(&self) -> Result<Vec<String>, DbError> {
         let mut findings = Vec::new();
         self.conn()
@@ -4122,6 +4239,9 @@ impl ModelContainer {
     /// `PRAGMA foreign_key_check`, parsed: every row whose foreign key names a parent that
     /// does not exist. Empty when every reference resolves. Runs on the whole file, which is
     /// what a migration's post-check and a settings-page validation both want.
+    ///
+    /// # Errors
+    /// Returns the storage error when the check cannot run. Violations are not errors.
     pub fn foreign_key_check(&self) -> Result<Vec<ForeignKeyViolation>, DbError> {
         Self::foreign_key_check_on(self.conn().as_mut())
     }
@@ -4144,6 +4264,9 @@ impl ModelContainer {
     /// Fold the WAL into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`), before the OS
     /// copies it whole (device backup). The engine's own answer comes back: whether a reader
     /// kept the checkpoint from completing, and how much of the log it folded.
+    ///
+    /// # Errors
+    /// Returns the storage error when the checkpoint cannot run.
     pub fn checkpoint(&self) -> Result<Checkpoint, DbError> {
         let mut result = Checkpoint::default();
         self.conn()
@@ -4157,6 +4280,11 @@ impl ModelContainer {
         Ok(result)
     }
 
+    /// Save pending changes, then rebuild the file compactly (`VACUUM`).
+    ///
+    /// # Errors
+    /// Returns the storage error when pending changes cannot be saved or the engine refuses the
+    /// `VACUUM`.
     pub fn vacuum(&self) -> Result<(), DbError> {
         self.save()?;
         self.conn().execute("VACUUM", &[]).map(|_| ())
@@ -4202,7 +4330,10 @@ impl ModelContainer {
             .and_then(|_| conn.execute("DETACH DATABASE day_export", &[]).map(|_| ()))
     }
 
-    /// Total size in bytes (page_count × page_size).
+    /// Total size in bytes (`page_count` × `page_size`).
+    ///
+    /// # Errors
+    /// Returns the storage error when the read fails.
     pub fn size_bytes(&self) -> Result<u64, DbError> {
         let mut pages = 0i64;
         let mut page_size = 0i64;
@@ -4374,7 +4505,7 @@ fn sql_literal(v: &Value) -> Result<String, DbError> {
             let mut s = String::with_capacity(b.len() * 2 + 3);
             s.push_str("X'");
             for byte in b {
-                s.push_str(&format!("{byte:02x}"));
+                let _ = write!(s, "{byte:02x}");
             }
             s.push('\'');
             s
@@ -4441,7 +4572,7 @@ fn join_batch(
     key: u64,
 ) {
     let clause = set.as_ref().map(|(c, _)| c.clone()).unwrap_or_default();
-    let print = set.as_ref().map(|(_, p)| fingerprint(p)).unwrap_or(0);
+    let print = set.as_ref().map_or(0, |(_, p)| fingerprint(p));
     let slot = (store, clause, print);
     if let Some(&i) = open.get(&slot)
         && let Batch::Keyed {
@@ -4468,7 +4599,7 @@ fn fingerprint(values: &[Value]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for b in bytes {
-            h ^= *b as u64;
+            h ^= u64::from(*b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     };
@@ -4527,7 +4658,7 @@ fn materialize(
     }
 
     let key_col = ident(&hooks.key_cols[0]);
-    let set_len = set.as_ref().map(|(_, p)| p.len()).unwrap_or(0);
+    let set_len = set.as_ref().map_or(0, |(_, p)| p.len());
     let cap = MAX_BOUND_PARAMS.saturating_sub(set_len).max(1);
     for chunk in keys.chunks(cap) {
         let mut params: Vec<Value> = Vec::with_capacity(set_len + chunk.len());
@@ -4567,7 +4698,7 @@ fn select_list(hooks: &TableHooks) -> String {
 /// One table's inserted rows as multi-row upserts: as many rows per statement as the
 /// parameter ceiling allows, so a thousand new rows are a few statements rather than a
 /// thousand.
-fn insert_stmts(hooks: &TableHooks, rows: Vec<Vec<Value>>, out: &mut Vec<(String, Vec<Value>)>) {
+fn insert_stmts(hooks: &TableHooks, rows: &[Vec<Value>], out: &mut Vec<(String, Vec<Value>)>) {
     let per_row = hooks.columns.len().max(1);
     let per_stmt = (MAX_BOUND_PARAMS / per_row).max(1);
     for chunk in rows.chunks(per_stmt) {
@@ -4729,6 +4860,9 @@ impl<M: Model> Query<M> {
     }
 
     /// Checked form of `ids`, for imports and commands that must not mistake failure for absence.
+    ///
+    /// # Errors
+    /// Returns the query's error when its last read failed.
     pub fn try_ids(&self) -> Result<Vec<ModelId<M>>, DbError> {
         let ids = self.ids();
         match self.state.error.get() {
@@ -4739,12 +4873,20 @@ impl<M: Model> Query<M> {
 
     /// A checked snapshot for non-UI work, fetched in batches. UI lists should use the query
     /// itself as their row source so they only materialize the visible working set.
+    ///
+    /// # Errors
+    /// Returns the query's error when its last read failed, or the storage or decoding error of a
+    /// row that cannot be read.
     pub fn try_collect(&self) -> Result<Vec<M>, DbError> {
         let ids = self.try_ids()?;
         let mut rows = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(64) {
             self.container
                 .ensure_resident::<M>(&chunk.iter().map(|id| id.handle()).collect::<Vec<_>>())?;
+            #[expect(
+                clippy::redundant_closure_for_method_calls,
+                reason = "`Option::cloned` as a path is ambiguous between `Option<&T>` and `Option<&mut T>`, and naming the type fixes the reference lifetime"
+            )]
             for id in chunk {
                 if let Some(row) = self.container.try_get::<M>(*id)?
                     && let Some(value) = row.with_value_untracked(|v| v.cloned())
@@ -4883,14 +5025,17 @@ pub struct QueryBuilder<'c, M: Model> {
 }
 
 impl<M: Model> QueryBuilder<'_, M> {
+    #[must_use]
     pub fn filter(mut self, p: Pred) -> Self {
         self.fetch = self.fetch.filter(p);
         self
     }
+    #[must_use]
     pub fn sort(mut self, s: Sort) -> Self {
         self.fetch = self.fetch.sort(s);
         self
     }
+    #[must_use]
     pub fn limit(mut self, n: usize) -> Self {
         self.fetch = self.fetch.limit(n);
         self
@@ -4904,7 +5049,7 @@ impl<M: Model> QueryBuilder<'_, M> {
     /// requery, the same dependency gating.
     pub fn live_count(self) -> CountQuery<M> {
         CountQuery {
-            state: self.container.install_state::<M>(self.fetch, None, true),
+            state: self.container.install_state::<M>(&self.fetch, None, true),
             container: self.container.clone(),
             _p: std::marker::PhantomData,
         }
@@ -4936,6 +5081,9 @@ impl<M: Model> CountQuery<M> {
         self.state.error
     }
     /// Checked count for operations that require a successful read.
+    ///
+    /// # Errors
+    /// Returns the query's error when its last read failed.
     pub fn try_get(&self) -> Result<usize, DbError> {
         let n = self.get();
         match self.state.error.get() {
@@ -5031,7 +5179,7 @@ impl ModelContainer {
     /// a filter toggle) re-counts itself when they change.
     pub fn count_fn<M: Model>(&self, f: impl Fn() -> Fetch + 'static) -> CountQuery<M> {
         let q = CountQuery::<M> {
-            state: self.install_state::<M>(f(), None, true),
+            state: self.install_state::<M>(&f(), None, true),
             container: self.clone(),
             _p: std::marker::PhantomData,
         };
@@ -5053,7 +5201,10 @@ impl ModelContainer {
             Some(RawQuery {
                 sql: sql.into(),
                 params,
-                tables: tables.iter().map(|s| s.to_string()).collect(),
+                tables: tables
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
             }),
         )
     }
@@ -5088,6 +5239,9 @@ impl ModelContainer {
 
     /// Flush pending edits before accessing the connection. The closure is never run if
     /// that save fails; its own error is returned unchanged.
+    ///
+    /// # Errors
+    /// Returns the error of the save, or the closure's own.
     pub fn try_with_connection<R>(
         &self,
         f: impl FnOnce(&mut dyn SqliteConnection) -> Result<R, DbError>,
@@ -5099,6 +5253,10 @@ impl ModelContainer {
     /// Re-read the resident rows from the file and re-run every query: the recovery from
     /// writes that bypassed the change log ([`ModelContainer::with_connection`], another
     /// process). O(working set + query results), never O(table).
+    ///
+    /// # Errors
+    /// Returns the storage error when pending changes cannot be saved or the rows cannot be read
+    /// again.
     pub fn rescan(&self) -> Result<(), DbError> {
         self.save()?;
         self.inner.blob_memo.borrow_mut().clear();
@@ -5123,6 +5281,10 @@ impl ModelContainer {
     /// Calling it again with the same alias swaps the file: the old one is detached, every
     /// resident row of its models dropped, and every live query re-run: the shape a
     /// downloaded catalog update takes.
+    ///
+    /// # Errors
+    /// Returns an error when `alias` is not a plain identifier, the file cannot be attached, or its
+    /// tables do not fit `schema`.
     pub fn attach_database(&self, alias: &str, path: &str, schema: Schema) -> Result<(), DbError> {
         if alias.is_empty() || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(DbError::new(
@@ -5171,7 +5333,12 @@ impl ModelContainer {
     /// Detach a database [`ModelContainer::attach_database`] holds, dropping every resident
     /// row of its models. Their stores stay registered (empty), so a query over them answers
     /// nothing until the alias is attached again.
+    ///
+    /// # Errors
+    /// Returns the storage error when pending changes cannot be saved or the database cannot be
+    /// detached.
     pub fn detach_database(&self, alias: &str) -> Result<(), DbError> {
+        type Doomed = Vec<(Rc<dyn Fn() -> Vec<u64>>, EvictFn)>;
         let position = self.inner.attached.borrow().iter().position(|a| a == alias);
         let Some(position) = position else {
             return Ok(());
@@ -5180,7 +5347,6 @@ impl ModelContainer {
             self.save()?;
         }
         self.inner.blob_memo.borrow_mut().clear();
-        type Doomed = Vec<(Rc<dyn Fn() -> Vec<u64>>, EvictFn)>;
         let doomed: Doomed = self
             .inner
             .tables
@@ -5217,6 +5383,9 @@ impl ModelContainer {
     /// ([`Capabilities::external_changes`]) this is `Ok(false)`; writes made
     /// through [`ModelContainer::with_connection`] are this connection's own and stay
     /// [`ModelContainer::rescan`]'s job.
+    ///
+    /// # Errors
+    /// Returns the storage error when the file cannot be read.
     pub fn check_external(&self) -> Result<bool, DbError> {
         if !self.inner.caps.external_changes {
             return Ok(false);
@@ -5321,7 +5490,7 @@ impl ModelContainer {
 
     fn install_state<M: Model>(
         &self,
-        fetch: Fetch,
+        fetch: &Fetch,
         raw: Option<RawQuery>,
         count_only: bool,
     ) -> Rc<QueryState> {
@@ -5341,7 +5510,7 @@ impl ModelContainer {
             count_only,
             count: Cell::new(0),
         });
-        self.rewire_watches(&state, &fetch);
+        self.rewire_watches(&state, fetch);
         self.inner.queries.borrow_mut().push(Rc::downgrade(&state));
         // The seed: flush anything pending (with autosave; without it the query answers from
         // the last save, documented), then one SQL round trip.
@@ -5359,9 +5528,13 @@ impl ModelContainer {
         state
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "every caller builds the fetch for this call and hands it over"
+    )]
     fn install_query<M: Model>(&self, fetch: Fetch, raw: Option<RawQuery>) -> Query<M> {
         Query {
-            state: self.install_state::<M>(fetch, raw, false),
+            state: self.install_state::<M>(&fetch, raw, false),
             container: self.clone(),
             _p: std::marker::PhantomData,
         }
@@ -5478,7 +5651,7 @@ impl ModelContainer {
         let states: Vec<Rc<QueryState>> = {
             let mut queries = self.inner.queries.borrow_mut();
             queries.retain(|w| w.strong_count() > 0);
-            queries.iter().filter_map(|w| w.upgrade()).collect()
+            queries.iter().filter_map(std::rc::Weak::upgrade).collect()
         };
         if states.is_empty() {
             return;
@@ -5496,9 +5669,7 @@ impl ModelContainer {
                     h.fields
                         .iter()
                         .position(|f| f == change.label)
-                        .map(|i| h.columns[i].clone())
-                        // A transient field: never a dependency column.
-                        .unwrap_or_else(|| "\u{0}".to_string())
+                        .map_or_else(|| "\u{0}".to_string(), |i| h.columns[i].clone())
                 })
             } else {
                 None
@@ -5521,8 +5692,8 @@ impl ModelContainer {
             // related store too, so the own-table check must not shadow the watch check.
             let own_stale = state.store_id == store
                 && match (key, change.op) {
-                    (None, _) => true, // a wholesale rewrite: anything may have moved
-                    (Some(_), Op::Insert) | (Some(_), Op::Delete) => true,
+                    // No key is a wholesale rewrite: anything may have moved.
+                    (None, _) | (Some(_), Op::Insert | Op::Delete) => true,
                     (Some(_), Op::Set) => match column {
                         // A row-level merge without a field name: assume the worst.
                         None => true,
@@ -5543,8 +5714,7 @@ impl ModelContainer {
                         return false;
                     }
                     match (key, change.op) {
-                        (None, _) => true,
-                        (Some(_), Op::Insert) | (Some(_), Op::Delete) => true,
+                        (None, _) | (Some(_), Op::Insert | Op::Delete) => true,
                         (Some(_), Op::Set) => {
                             w.fields.contains(&change.label)
                                 || column.is_some_and(|c| w.columns.contains(&c))
@@ -5568,7 +5738,7 @@ impl ModelContainer {
             .queries
             .borrow()
             .iter()
-            .filter_map(|w| w.upgrade())
+            .filter_map(std::rc::Weak::upgrade)
             .collect();
         for state in states {
             let mut due = state.needs_sql.replace(false) | state.pending_commit.replace(false);
@@ -5592,7 +5762,7 @@ impl ModelContainer {
             .queries
             .borrow()
             .iter()
-            .filter_map(|w| w.upgrade())
+            .filter_map(std::rc::Weak::upgrade)
             .collect();
         for state in states {
             state.needs_sql.set(false);
@@ -5617,7 +5787,7 @@ impl ModelContainer {
             .queries
             .borrow()
             .iter()
-            .filter_map(|w| w.upgrade())
+            .filter_map(std::rc::Weak::upgrade)
             .collect();
         for state in states {
             let reads = match &state.raw {
@@ -5956,8 +6126,7 @@ impl SqlIndex for SqlSnapshot {
         self.tables
             .iter()
             .find(|t| t.table == table)
-            .map(|t| t.sql.clone())
-            .unwrap_or_else(|| ident(table))
+            .map_or_else(|| ident(table), |t| t.sql.clone())
     }
 
     fn fts_of(&self, table: &str) -> Option<FtsSql> {
@@ -5967,12 +6136,11 @@ impl SqlIndex for SqlSnapshot {
             .and_then(|t| t.fts.clone())
     }
 
-    fn fts_key_of(&self, table: &str) -> &str {
+    fn fts_key_of(&self, table: &str) -> &'static str {
         self.tables
             .iter()
             .find(|t| t.table == table)
-            .map(|t| t.fts_key)
-            .unwrap_or("rowid")
+            .map_or("rowid", |t| t.fts_key)
     }
 
     fn geo_of(&self, table: &str, lat: &str, lon: &str) -> Option<String> {
@@ -6080,7 +6248,7 @@ mod pieces_glue {
 
         fn refresh(&self) -> Vec<u64> {
             let keys: Vec<u64> = self.query.ids().iter().map(|id| id.handle()).collect();
-            *self.keys.borrow_mut() = keys.clone();
+            (*self.keys.borrow_mut()).clone_from(&keys);
             keys
         }
         fn len(&self) -> usize {
@@ -6161,7 +6329,7 @@ pub use pieces_glue::QueryConn;
 // Date and time codecs (feature `datetime`; docs/persistence.md)
 // ---------------------------------------------------------------------------
 
-/// Column codecs for day::datetime's [`DayDate`](day_spec::controls::datetime::DayDate) and
+/// Column codecs for `day::datetime`'s [`DayDate`](day_spec::controls::datetime::DayDate) and
 /// [`DayTime`](day_spec::controls::datetime::DayTime), for `#[derive(Model)]` fields.
 ///
 /// Canonical, what a bare field of the type stores: `DayDate` → `INTEGER` epoch days,

@@ -48,11 +48,11 @@ fn a_large_dirty_transaction_amortizes_eviction_scans() {
         "quadratic eviction work: {} scanned keys",
         scanned.get()
     );
-    assert_eq!(store.with_untracked(|k| k.len()), 4096);
+    assert_eq!(store.with_untracked(day_model::Keyed::len), 4096);
     c.save().unwrap();
     // Commit releases the pins: even a missing-row fault retries eviction immediately.
     assert!(c.try_get::<Fixture>(5000u64).unwrap().is_none());
-    assert!(store.with_untracked(|k| k.len()) <= 64);
+    assert!(store.with_untracked(day_model::Keyed::len) <= 64);
     for id in [1u64, 2048, 4096] {
         assert!(c.try_get::<Fixture>(id).unwrap().unwrap().value().peek());
     }
@@ -71,12 +71,12 @@ fn a_bulk_insert_is_trimmed_at_save() {
     }
     let store = c.cache::<Fixture>();
     assert_eq!(
-        store.with_untracked(|k| k.len()),
+        store.with_untracked(day_model::Keyed::len),
         4096,
         "dirty rows are pinned until the flush"
     );
     c.save().unwrap();
-    let resident = store.with_untracked(|k| k.len());
+    let resident = store.with_untracked(day_model::Keyed::len);
     assert!(
         resident <= 256 + 64,
         "the flush released the pins and trimmed the cache: {resident} resident"

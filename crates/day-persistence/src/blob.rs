@@ -114,15 +114,27 @@ impl ColumnValue for Blob {
 /// memory; otherwise the container answers from its byte-bounded memo or the file.
 pub trait BlobField {
     /// The whole value. Empty when the column is `NULL` or the row is gone.
+    ///
+    /// # Errors
+    /// Returns the storage error when the value cannot be read.
     fn bytes(&self) -> Result<Arc<Vec<u8>>, DbError>;
     /// The value's length in bytes, without reading it (`length(col)` in SQL).
+    ///
+    /// # Errors
+    /// Returns the storage error when the length cannot be read.
     fn len(&self) -> Result<usize, DbError>;
     /// Whether the value is empty or `NULL`.
+    ///
+    /// # Errors
+    /// Returns the storage error when the length cannot be read.
     fn is_empty(&self) -> Result<bool, DbError> {
         Ok(self.len()? == 0)
     }
     /// `range` of the value, clamped to its length: `substr(col, …)` in SQL, so only the
     /// requested bytes cross from the engine.
+    ///
+    /// # Errors
+    /// Returns the storage error when the bytes cannot be read.
     fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>, DbError>;
     /// Write new bytes: the field becomes pending until the next flush.
     fn write_bytes(&self, bytes: impl Into<Vec<u8>>);
@@ -196,13 +208,12 @@ impl BlobReader {
 
 impl std::io::Read for BlobReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let end = match self.end {
-            Some(e) => e,
-            None => {
-                let e = (self.len)().map_err(std::io::Error::other)?;
-                self.end = Some(e);
-                e
-            }
+        let end = if let Some(e) = self.end {
+            e
+        } else {
+            let e = (self.len)().map_err(std::io::Error::other)?;
+            self.end = Some(e);
+            e
         };
         if self.pos >= end || buf.is_empty() {
             return Ok(0);
@@ -227,8 +238,7 @@ fn column_of<M: Model>(field: &'static str) -> &'static str {
     M::COLUMNS
         .iter()
         .find(|c| c.field == field)
-        .map(|c| c.name)
-        .unwrap_or(field)
+        .map_or(field, |c| c.name)
 }
 
 /// The container holding this field's store, with the store id and the row's key handle.

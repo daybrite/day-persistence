@@ -6,6 +6,7 @@
 //! engine answers every fetch; these tests watch the SQL trace to prove which changes cost a
 //! requery and which cost nothing.
 
+use std::assert_matches;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -143,18 +144,14 @@ fn deltas_feed_through_take_events() {
 
     store.elem(2).done().write(true); // leaves the set
     let events = q.take_events();
-    assert!(
-        matches!(events, QueryEvents::Deltas(ref d) if d.len() == 1),
-        "{events:?}"
-    );
+    assert_matches!(events, QueryEvents::Deltas(ref d) if d.len() == 1,
+        "{events:?}");
 
     store.elem(1).start_day().write(99); // moves to the end
     store.elem(3).done().write(true); // and another leaves
     let events = q.take_events();
-    assert!(
-        matches!(events, QueryEvents::Deltas(ref d) if d.len() == 2),
-        "coalesced into one drain: {events:?}"
-    );
+    assert_matches!(events, QueryEvents::Deltas(ref d) if d.len() == 2,
+        "coalesced into one drain: {events:?}");
     assert_eq!(q.take_events(), QueryEvents::None);
 }
 

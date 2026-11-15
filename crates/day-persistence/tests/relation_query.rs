@@ -8,6 +8,7 @@
 //! everything would not satisfy them: the claim is that a related column the predicate never
 //! reads costs nothing, and that one the predicate does read moves exactly the rows it can.
 
+use std::assert_matches;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -284,13 +285,10 @@ fn a_related_predicate_column_moves_exactly_one_row() {
     // Unconfirming Oslo's only lodging takes Oslo out: one requery, one precise delta.
     c.cache::<Lodging>().elem(12).confirmed().write(false);
     assert_eq!(q.ids().iter().map(|i| i.handle()).collect::<Vec<_>>(), [1]);
-    assert!(
-        matches!(
+    assert_matches!(
             q.take_events(),
-            day_persistence::QueryEvents::Deltas(d) if d.len() == 1
-        ),
-        "and the consumer is told which row left, not to reload"
-    );
+            day_persistence::QueryEvents::Deltas(d) if d.len() == 1,
+        "and the consumer is told which row left, not to reload");
 }
 
 #[test]

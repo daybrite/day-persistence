@@ -22,8 +22,7 @@ struct Note {
 fn title_of(container: &ModelContainer, id: u32) -> String {
     container
         .get::<Note>(id)
-        .map(|note| note.title().peek())
-        .unwrap_or_default()
+        .map_or_default(|note| note.title().peek())
 }
 
 fn temp_db(name: &str) -> std::path::PathBuf {

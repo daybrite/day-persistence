@@ -415,8 +415,7 @@ impl DatabaseWorker {
             Ok(session
                 .undo
                 .as_ref()
-                .map(|u| (u.can_undo().get_untracked(), u.can_redo().get_untracked()))
-                .unwrap_or_default())
+                .map_or_default(|u| (u.can_undo().get_untracked(), u.can_redo().get_untracked())))
         })
     }
 

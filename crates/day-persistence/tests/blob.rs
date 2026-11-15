@@ -89,7 +89,7 @@ fn photo(id: u64, data: Option<Vec<u8>>) -> Photo {
     Photo {
         id,
         name: format!("photo {id}"),
-        data: data.map(Blob::new).unwrap_or_default(),
+        data: data.map_or_default(Blob::new),
         stars: 0,
     }
 }

@@ -1190,7 +1190,7 @@ fn string_literal(lit: &proc_macro::Literal) -> Result<String, String> {
             other => {
                 return Err(format!(
                     "unsupported escape `\\{}` in {s}",
-                    other.map(String::from).unwrap_or_default()
+                    other.map_or_default(String::from)
                 ));
             }
         }

@@ -1025,15 +1025,15 @@ mod tests {
             conn,
             sql: "ALTER TABLE old_books RENAME TO books; INSERT INTO missing VALUES (1);".into(),
         });
-        assert!(matches!(failed, Reply::Err(_)));
-        assert!(matches!(
+        std::assert_matches!(failed, Reply::Err(_));
+        std::assert_matches!(
             ask(Req::Exec {
                 conn,
                 sql: "ROLLBACK".into(),
                 params: vec![]
             }),
             Reply::Changes(_)
-        ));
+        );
         assert_eq!(
             ask(Req::Query {
                 conn,
@@ -1308,9 +1308,6 @@ mod tests {
             let len = u32::from_le_bytes(core::slice::from_raw_parts(out, 4).try_into().unwrap());
             core::slice::from_raw_parts(out.add(4), len as usize).to_vec()
         };
-        assert!(matches!(
-            protocol::decode_reply(&reply),
-            Ok(Reply::Names(_))
-        ));
+        std::assert_matches!(protocol::decode_reply(&reply), Ok(Reply::Names(_)));
     }
 }

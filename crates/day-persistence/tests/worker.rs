@@ -714,7 +714,7 @@ fn many_concurrent_closers_finish_while_writers_race_admission() {
                     Ok(()) => {
                         accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    Err(e) => assert!(matches!(e.kind, DbErrorKind::Closed | DbErrorKind::Busy)),
+                    Err(e) => std::assert_matches!(e.kind, DbErrorKind::Closed | DbErrorKind::Busy),
                 }
             }
         }));

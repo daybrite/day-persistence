@@ -1832,10 +1832,7 @@ impl ModelContainer {
         for store in &dirty.full {
             let keys = {
                 let tables = self.inner.tables.borrow();
-                tables
-                    .get(store)
-                    .map(|h| (h.resident_keys)())
-                    .unwrap_or_default()
+                tables.get(store).map_or_default(|h| (h.resident_keys)())
             };
             written.entry(*store).or_default().extend(keys);
         }
@@ -1900,7 +1897,7 @@ impl ModelContainer {
         let mut bytes = Vec::new();
         self.conn()
             .query(&format!("SELECT {tail}"), &params, &mut |row| {
-                bytes = row.get(0).as_blob().map(<[u8]>::to_vec).unwrap_or_default();
+                bytes = row.get(0).as_blob().map_or_default(<[u8]>::to_vec);
             })?;
         let bytes = std::sync::Arc::new(bytes);
         let limit = self.inner.blob_cache_limit.get();
@@ -1929,10 +1926,7 @@ impl ModelContainer {
         };
         let clause = {
             let tables = self.inner.tables.borrow();
-            tables
-                .get(&store)
-                .map(|h| (h.key_where)(key).0)
-                .unwrap_or_default()
+            tables.get(&store).map_or_default(|h| (h.key_where)(key).0)
         };
         let mut len = 0usize;
         self.conn().query(
@@ -1971,10 +1965,7 @@ impl ModelContainer {
         };
         let clause = {
             let tables = self.inner.tables.borrow();
-            tables
-                .get(&store)
-                .map(|h| (h.key_where)(key).0)
-                .unwrap_or_default()
+            tables.get(&store).map_or_default(|h| (h.key_where)(key).0)
         };
         let mut all = vec![
             Value::Int(range.start as i64 + 1),
@@ -1988,7 +1979,7 @@ impl ModelContainer {
                 ident(column)
             ),
             &all,
-            &mut |row| bytes = row.get(0).as_blob().map(<[u8]>::to_vec).unwrap_or_default(),
+            &mut |row| bytes = row.get(0).as_blob().map_or_default(<[u8]>::to_vec),
         )?;
         Ok(bytes)
     }
@@ -4319,8 +4310,7 @@ impl ModelContainer {
         let quoted_path = path.to_string_lossy().replace('\'', "''");
         let quoted_key = key
             .as_ref()
-            .map(|k| k.reveal().replace('\'', "''"))
-            .unwrap_or_default();
+            .map_or_default(|k| k.reveal().replace('\'', "''"));
         let mut conn = self.conn();
         conn.execute(
             &format!("ATTACH DATABASE '{quoted_path}' AS day_export KEY '{quoted_key}'"),
@@ -4571,7 +4561,7 @@ fn join_batch(
     set: Option<(String, Vec<Value>)>,
     key: u64,
 ) {
-    let clause = set.as_ref().map(|(c, _)| c.clone()).unwrap_or_default();
+    let clause = set.as_ref().map_or_default(|(c, _)| c.clone());
     let print = set.as_ref().map_or(0, |(_, p)| fingerprint(p));
     let slot = (store, clause, print);
     if let Some(&i) = open.get(&slot)

@@ -53,7 +53,7 @@ impl Sqlite {
     }
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     /// The database named `name` (`"notes.db"`: `.db` by convention) in the app's data
-    /// directory, `day_spec::storage::data_dir()`, created if missing: a folder named for the app
+    /// directory, `day_process::storage::data_dir()`, created if missing: a folder named for the app
     /// in the platform's place for app data (Application Support, `%LOCALAPPDATA%`,
     /// `$XDG_DATA_HOME`, the Android and HarmonyOS files directory; Day's docs/fs.md "Where files
     /// live"), or `DAY_DATA_DIR` when a host or a test sets it. `name` is a file name, not a path.
@@ -319,11 +319,11 @@ impl SqliteDriver for Sqlite {
     }
 }
 
-/// The app's data directory (`day_spec::storage::data_dir()`), shared with day-part-filesystem
+/// The app's data directory (`day_process::storage::data_dir()`), shared with day-part-filesystem
 /// (whose files keep to its `day-fs/` leaf) and everything else of the app's.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn app_data_root() -> Result<std::path::PathBuf, DbError> {
-    day_spec::storage::data_dir().ok_or_else(|| {
+    day_process::storage::data_dir().ok_or_else(|| {
         DbError::new(
             DbErrorKind::Unsupported,
             "no per-app data directory on this target",

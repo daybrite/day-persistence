@@ -32,6 +32,8 @@ datetime = ["dep:day-spec"]
 
 [dependencies]
 day-async = { workspace = true }
+# `storage::data_dir()`: where a named database lives.
+day-process = { workspace = true }
 day-model = { workspace = true }
 day-reactive = { workspace = true }
 # `#[derive(Model)]`, re-exported beside the trait of the same name, and day-macros'

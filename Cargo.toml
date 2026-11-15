@@ -15,6 +15,7 @@ description = "Typed SQLite persistence and browser storage for Day apps"
 day-persistence-macros = { path = "crates/day-persistence-macros", version = "0.*" }
 day-sqlite-worker = { path = "crates/day-sqlite-worker", version = "0.*" }
 day-async = "0.*"
+day-process = "0.*"
 day-model = "0.*"
 day-reactive = "0.*"
 day-macros = "0.*"
